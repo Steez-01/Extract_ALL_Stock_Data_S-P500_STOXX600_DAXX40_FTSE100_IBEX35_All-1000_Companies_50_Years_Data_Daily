@@ -1,8 +1,9 @@
 # Extract-ALL-Stock-Data-S-P500-All-500-Ticker-50-Years-Data-Daily-Interval
+
+S&P500 has been completed the procedure, all other ETF's have now been started as project. The first 60% of Companies will be straightforward to extract as mostlikely in many cases uses same code, the following 40% will be the harder element. 
+
 Extract ALL Stock Data S&amp;P500 All 500 Ticker 50 Years Data Daily Interval. Can be configured easily to do more than 50 year data on daily interval
 50 Years * 365 days * 500 Companies = 9125000 Excel Data Cells and yes due to not every company being 50 years old it will be >4,5 million cells total. -did not count yet - 
-
-S&P500 has been completed the procedure, all other ETF's have now been started as project. The first 60% of Companies will be easy to extract , the following 40% will be the harder element. 
 
 the code to always be up-to-date without you manually changing the date, you can use:
 
