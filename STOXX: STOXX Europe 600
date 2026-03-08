@@ -1,2 +1,55 @@
 STOXX: STOXX Europe 600 Extract
- -It is to be updated real soon-
+
+import pandas as pd
+import yfinance as yf
+import os
+
+# --- STEP 1: DEFINE TICKERS WITH SUFFIXES ---
+# Note: You must ensure these suffixes are correct for Yahoo Finance
+tickers = [
+    "ASML.AS","ROG.SW","NOVN.SW","AZN.L","NESN.SW","SAP.DE","SU.PA","ALV.DE","ULVR.L","DTE.DE","ABBN.SW","BBVA.MC","NOVO B.CO","GSK.L","BNP.PA","OR.PA","ZURN.SW","SAN.PA","ISP.MI","DG.PA","CS.PA","RMS.PA","LLOY.L","ITX.MC","REL.L","NWG.L","NDA.HE","LSEG.L","VOLV B.ST","DB1.DE","BN.PA","ATCO A.ST","RKT.L","SREN.SW","LONN.SW","SAND.ST","G.MI","LR.PA","NOK.HE","ALC.SW","CABK.MC","ORA.PA","ASSA B.ST","III.L","PRU.L","SDZ.SW","PRY.MI","EXPN.L","SWED A.ST","DANSKE.CO","SEB A.ST","SLHN.SW","VOD.L","ADS.DE","GIVN.SW","KNEBV.HE","AMS.MC","BMW.DE","SAMPO.HE","GEBN.SW","DNB.OL","ACS.MC","VWS.CO","SHB A.ST","SCMN.SW","PHG.AS","FRE.DE","ACA.PA","CAP.PA","VNA.DE","A5G.IR","KER.PA","STM.AS","KPN.AS","ANTO.L","BOL.ST","ABNA.AS","WKL.AS","LGEN.L","SAB.MC","CLNX.MC","MRK.DE","EPI A.ST","ESSITY B.ST","ALFA.ST","SHL.DE","DSY.PA","RTO.L","TEF.MC","SCHP.SW","KGP.IR","MONC.MI","INFR.L","FBK.MI","HEN3.DE","CCH.L","LOGN.SW","KYGA.IR","UU..L","METSO.HE","SOON.SW","URW.PA","BVI.PA","TEL2 B.ST","SVT.L","COLO B.CO","MOWI.OL","ALO.PA","SGE.L","AKZA.AS","MKS.L","G1A.DE","ASRNL.AS","ORK.OL","FME.DE","SKF B.ST","HM B.ST","BEI.DE","AGN.AS","RXL.PA","MNG.L","LI.PA","PSON.L","HOT.DE","SLET.L","CON.DE","KBX.DE","KGF.L","STB.OL","KCR.HE","SCA B.ST","GBLB.BR","CTEC.L","RNO.PA","LAND.L","PNDORA.CO","MRL.MC","BDEV.L","ANA.MC","NDX1.DE","WTB.L","BRBY.L","NEX.PA","BLND.L","JDEP.AS","RBI.VI","ZAL.DE","AMUN.PA","ALE.WA","EDEN.PA","AAK.ST","GJF.OL","BKG.L","NDA.DE","ANDR.VI","ELIS.PA","BBOX.L","ISS.CO","CRDA.L","P911.DE","TEMN.SW","TW..L","IMCD.AS","CAST.ST","SIG.SW","JMAT.L","VALMT.HE","EDPR.LS","TEP.PA","SALM.OL","FI-N.SW","KGX.DE","RS1.L","GFC.PA","RAND.AS","COV.PA","FLU.CO","PNN.L","GRF.MC","HUH1V.HE","MTO.L","FR.PA","TOM.OL","PUM.DE","LIGHT.AS","FPE3.DE","MF.PA","THULE.ST","UTG.L"
+    # Add your full list of ~200 here with suffixes (.L, .PA, .DE, .SW, .MI, .MC, .AS, .ST, .CO)
+]
+
+print(f"Phase 1: Validating {len(tickers)} Tickers and fetching Market Caps...")
+
+cap_list = []
+
+for t in tickers:
+    try:
+        stock = yf.Ticker(t)
+        # We fetch info - Note: this can be slow for 200+ tickers
+        info = stock.info
+        m_cap = info.get('marketCap', 0)
+        
+        # We also grab the currency to note if rankings might be skewed
+        currency = info.get('currency', 'EUR')
+        
+        cap_list.append({'Ticker': t, 'MarketCap': m_cap, 'Currency': currency})
+        print(f"Success: {t} ({currency})")
+    except Exception:
+        print(f"FAILED: {t}")
+        cap_list.append({'Ticker': t, 'MarketCap': 0, 'Currency': 'N/A'})
+
+# Sort by Market Cap (Approximated Weighting)
+sorted_df = pd.DataFrame(cap_list).sort_values(by='MarketCap', ascending=False)
+ordered_tickers = sorted_df[sorted_df['MarketCap'] > 0]['Ticker'].tolist()
+
+print(f"\nPhase 2: Downloading Daily Data for {len(ordered_tickers)} stocks...")
+
+start = "1976-01-01"
+end = "2026-03-08"
+
+# Bulk download
+data = yf.download(ordered_tickers, start=start, end=end, auto_adjust=True)["Close"]
+
+# Finalize formatting
+data = data[ordered_tickers]
+df_wide = data.transpose()
+df_wide.columns = df_wide.columns.strftime('%Y-%m-%d')
+
+file_name = "STOXX600_Custom_Weighted.csv"
+df_wide.to_csv(file_name)
+
+print("-" * 30)
+print(f"Done! Exported {len(ordered_tickers)} stocks to {file_name}")
