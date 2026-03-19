@@ -1,4 +1,4 @@
-# Extract-ALL-Stock-Data-SP500 ; Stoxx600 ; Daxx40 ; FTSE100 -All-500-Ticker-50-Years-Data-Daily-Interval
+# Extract-ALL-Stock-Data-SP500 ; Stoxx600 ; Daxx40 ; FTSE100 ; Brazil MSCI 25/50 ; Mexico 25/50 -All 1000 Tickers 50 Years Data Daily Interval
 
 S&P500 USA & Dax40 Germany & Stoxx600 & FTSE100 & MSCI Spain has been completed the procedure, all other ETF's have now been started as project. The first 60% of Companies will be straightforward to extract as mostlikely in many cases uses same code, the following 40% will be the harder element as those are the small/smaller cap stocks. 
 
