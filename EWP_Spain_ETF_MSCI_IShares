@@ -1,2 +1,105 @@
 EWP: iShares MSCI Spain
--Will be updated real soon-
+
+import pandas as pd
+import yfinance as yf
+import ssl
+import urllib.request
+import numpy as np
+
+# --- BYPASS SSL CERTIFICATE ISSUES ---
+ssl._create_default_https_context = ssl._create_unverified_context
+
+def apply_25_50_capping(df_caps):
+    """
+    Applies MSCI 25/50 Rule:
+    1. No single stock > 25%
+    2. Sum of all stocks > 5% must be <= 50%
+    """
+    # Calculate initial market-cap weights
+    total_mcap = df_caps['MarketCap'].sum()
+    df_caps['Weight'] = df_caps['MarketCap'] / total_mcap
+    df_caps = df_caps.sort_values('Weight', ascending=False).reset_index(drop=True)
+
+    # Iterative capping process
+    for _ in range(100): # Usually converges in 5-10 iterations
+        # --- RULE 1: Cap any single stock at 22.5% (Buffer for the 25% hard limit) ---
+        excess = 0
+        for i in range(len(df_caps)):
+            if df_caps.loc[i, 'Weight'] > 0.225:
+                excess += df_caps.loc[i, 'Weight'] - 0.225
+                df_caps.loc[i, 'Weight'] = 0.225
+        
+        # Redistribute excess to all stocks NOT capped
+        if excess > 0:
+            uncapped_mask = df_caps['Weight'] < 0.225
+            df_caps.loc[uncapped_mask, 'Weight'] += excess * (df_caps.loc[uncapped_mask, 'Weight'] / df_caps.loc[uncapped_mask, 'Weight'].sum())
+
+        # --- RULE 2: Group of > 5% stocks must be <= 45% (Buffer for the 50% limit) ---
+        large_weights_mask = df_caps['Weight'] > 0.048
+        sum_large = df_caps.loc[large_weights_mask, 'Weight'].sum()
+        
+        if sum_large > 0.45:
+            excess_large = sum_large - 0.45
+            # Scale down the large weights proportionally
+            df_caps.loc[large_weights_mask, 'Weight'] *= (0.45 / sum_large)
+            # Redistribute to the small weights
+            small_weights_mask = ~large_weights_mask
+            df_caps.loc[small_weights_mask, 'Weight'] += excess_large * (df_caps.loc[small_weights_mask, 'Weight'] / df_caps.loc[small_weights_mask, 'Weight'].sum())
+        
+        # Check if constraints are met to break early
+        if df_caps['Weight'].max() <= 0.25 and df_caps[df_caps['Weight'] > 0.05]['Weight'].sum() <= 0.50:
+            break
+            
+    return df_caps
+
+def get_spanish_tickers():
+    url = "https://en.wikipedia.org/wiki/IBEX_35"
+    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+    try:
+        with urllib.request.urlopen(req) as response:
+            tables = pd.read_html(response)
+            df = tables[1] 
+            possible_names = ['Ticker', 'Symbol', 'Ticker symbol', 'Stock symbol']
+            ticker_col = next((name for name in possible_names if name in df.columns), df.columns[0])
+            tickers = df[ticker_col].astype(str).str.strip() + ".MC"
+            return tickers.tolist()
+    except Exception as e:
+        print(f"Error fetching Spanish list: {e}")
+        return ["SAN.MC", "IBE.MC", "BBVA.MC", "ITX.MC", "TEF.MC"]
+
+# --- PHASE 1: GET DATA ---
+tickers = get_spanish_tickers()
+cap_list = []
+
+for t in tickers:
+    try:
+        stock = yf.Ticker(t)
+        m_cap = stock.info.get('marketCap', 0)
+        cap_list.append({'Ticker': t, 'MarketCap': m_cap})
+    except:
+        continue
+
+df_weighted = pd.DataFrame(cap_list)
+df_weighted = df_weighted[df_weighted['MarketCap'] > 0]
+
+# --- PHASE 2: APPLY CAPPING ---
+print("\nApplying 25/50 Capping Logic...")
+df_final_weights = apply_25_50_capping(df_weighted)
+
+print("\n--- FINAL CONCENTRATION CHECK ---")
+print(f"Max Weight: {df_final_weights['Weight'].max()*100:.2f}% (Limit 25%)")
+large_sum = df_final_weights[df_final_weights['Weight'] > 0.05]['Weight'].sum()
+print(f"Sum of Weights > 5%: {large_sum*100:.2f}% (Limit 50%)")
+
+# --- PHASE 3: EXPORT ---
+# Using ordered_tickers from weighted results
+ordered_tickers = df_final_weights['Ticker'].tolist()
+data = yf.download(ordered_tickers, start="1976-01-01", end="2026-03-08", auto_adjust=True)
+
+close_data = data['Close'][ordered_tickers]
+df_export = close_data.transpose()
+df_export.to_csv("MSCI_Spain_25_50_Weighted.csv")
+
+# Print the weights for your records
+df_final_weights[['Ticker', 'Weight']].to_csv("Final_Weights_Logic.csv", index=False)
+print("\nDone! Weights and prices exported.")
