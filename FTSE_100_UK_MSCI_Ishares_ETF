@@ -1,0 +1,94 @@
+
+import pandas as pd
+import yfinance as yf
+import ssl
+import urllib.request  # <--- This was the missing piece!
+
+# --- BYPASS SSL CERTIFICATE ISSUES ---
+ssl._create_default_https_context = ssl._create_unverified_context
+
+def get_ftse100_tickers():
+    url = "https://en.wikipedia.org/wiki/FTSE_100_Index"
+    # Use a User-Agent to prevent 403 Forbidden errors
+    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+    
+    try:
+        with urllib.request.urlopen(req) as response:
+            tables = pd.read_html(response)
+            # The constituents list is usually the largest table on this page
+            df = max(tables, key=len) 
+            
+            # Find the ticker column dynamically (Wikipedia changes names occasionally)
+            possible_names = ['EPIC', 'Ticker', 'Symbol', 'Stock symbol', 'Ticker symbol']
+            ticker_col = next((name for name in possible_names if name in df.columns), df.columns[0])
+            
+            print(f"Found ticker column: {ticker_col}")
+            
+            # Format for Yahoo Finance: Replace dot with dash and add .L
+            # e.g., BT.A -> BT-A.L
+            tickers = df[ticker_col].astype(str).str.replace('.', '-', regex=False) + ".L"
+            return tickers.tolist()
+    except Exception as e:
+        print(f"Error fetching FTSE list: {e}")
+        return []
+
+# --- PHASE 1: GET TICKERS & VALIDATE WEIGHTS ---
+tickers = get_ftse100_tickers()
+
+if not tickers:
+    print("CRITICAL: No tickers were retrieved. Check internet or SSL settings.")
+    exit()
+
+print(f"Phase 1: Validating {len(tickers)} FTSE 100 Tickers and fetching Market Caps...")
+
+cap_list = []
+for t in tickers:
+    try:
+        # Note: This part takes time as it calls the API for each stock
+        stock = yf.Ticker(t)
+        info = stock.info
+        m_cap = info.get('marketCap', 0)
+        currency = info.get('currency', 'GBP')
+        
+        cap_list.append({'Ticker': t, 'MarketCap': m_cap, 'Currency': currency})
+        print(f"Success: {t} | Cap: {m_cap:,} {currency}")
+    except Exception:
+        print(f"FAILED info fetch for: {t}")
+        cap_list.append({'Ticker': t, 'MarketCap': 0, 'Currency': 'N/A'})
+
+# Sort by Market Cap to approximate index weighting
+sorted_df = pd.DataFrame(cap_list)
+if not sorted_df.empty and 'MarketCap' in sorted_df.columns:
+    sorted_df = sorted_df.sort_values(by='MarketCap', ascending=False)
+    ordered_tickers = sorted_df[sorted_df['MarketCap'] > 0]['Ticker'].tolist()
+else:
+    print("No valid MarketCap data found.")
+    exit()
+
+# --- PHASE 2: DOWNLOAD HISTORICAL DATA ---
+print(f"\nPhase 2: Downloading Daily Data for {len(ordered_tickers)} stocks...")
+start = "1976-01-01"
+end = "2026-03-08"
+
+# Bulk download historical prices
+data = yf.download(ordered_tickers, start=start, end=end, auto_adjust=True)
+
+# Handle MultiIndex if necessary and extract Close prices
+if isinstance(data.columns, pd.MultiIndex):
+    close_data = data['Close']
+else:
+    close_data = data
+
+# Reorder columns to match our Market Cap sorting
+close_data = close_data[ordered_tickers]
+
+# --- PHASE 3: EXPORT ---
+# Transpose so rows are Tickers and columns are Dates
+df_wide = close_data.transpose()
+df_wide.columns = pd.to_datetime(df_wide.columns).strftime('%Y-%m-%d')
+
+file_name = "FTSE100_MarketCap_Sorted.csv"
+df_wide.to_csv(file_name)
+
+print("-" * 30)
+print(f"Done! Exported {len(ordered_tickers)} stocks to {file_name}")
