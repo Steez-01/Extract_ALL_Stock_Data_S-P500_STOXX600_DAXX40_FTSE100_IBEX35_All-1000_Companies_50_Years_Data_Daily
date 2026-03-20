@@ -1,6 +1,6 @@
-# Extract-ALL-Stock-Data-SP500 ; Stoxx600 ; Daxx40 ; FTSE100 ; Brazil MSCI 25/50 ; France 40 ; Mexico 25/50 -All 1000 Tickers 50 Years Data Daily Interval
+# Extract-ALL-Stock-Data-SP500 ; Stoxx600 ; Daxx40 ; FTSE100 ; Japan 180 ; Brazil MSCI 25/50 ; France 40 ; Mexico 25/50 ; Portugal 20 ;  -All 1000 Tickers 50 Years Data Daily Interval
 
-S&P500 USA ; Stoxx600 ; Dax40 Germany ; FTSE100 ; MSCI Spain ; Brazil MSCI 25/50 ; France 40 ; Mexico 25/50 has been completed the procedure, all other ETF's have now been started as project. The first 60% of Companies will be straightforward to extract as mostlikely in many cases uses same code, the following 40% will be the harder element as those are the small/smaller cap stocks. 
+S&P500 USA ; Stoxx600 ; Dax40 Germany ; FTSE100 ; Japan 180 ;  MSCI Spain 57; Brazil MSCI 25/50 ; France 40 ; Mexico 25/50 ; Portugal 20 has been completed the procedure, all other ETF's have now been started as project. 
 
 Extract ALL Stock Data S&amp;P500 All 500 Ticker 50 Years Data Daily Interval. Can be configured easily to do more than 50 year data on daily interval
 50 Years * 365 days * 500 Companies = 9.125.000 Excel Data Cells and yes due to not every company being 50 years old it will be >4,5 million cells total. -did not count yet - 
