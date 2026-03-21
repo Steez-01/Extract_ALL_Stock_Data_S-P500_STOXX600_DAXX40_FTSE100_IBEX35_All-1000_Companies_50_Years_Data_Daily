@@ -1,1 +1,88 @@
-Stoxx200
+import pandas as pd
+import yfinance as yf
+import ssl
+
+# --- BYPASS SSL CERTIFICATE ISSUES ---
+ssl._create_default_https_context = ssl._create_unverified_context
+
+def get_manual_stoxx_200():
+    """
+    Hardcoded list of the top ~200 European tickers to ensure 100% completeness.
+    Includes major markets: UK, Germany, France, Netherlands, Switzerland, Spain, Italy.
+    """
+    # This list covers the heavyweights of the STOXX 600 universe
+    tickers_str = (
+        "MC.PA, ASML.AS, NESN.SW, NOVN.SW, ROG.SW, SAP.DE, TTE.PA, HSBA.L, AZN.L, UNA.AS, "
+        "OR.PA, SIE.DE, IDFP.PA, AIR.PA, ALV.DE, IBE.MC, SAN.MC, ITX.MC, RMS.PA, EL.PA, "
+        "BMW.DE, MBG.DE, BAS.DE, BAYN.DE, DBK.DE, ENEL.MI, ISP.MI, UCG.MI, SHEL.L, BP.L, "
+        "GSK.L, RIO.L, REL.L, VOD.L, DGE.L, BATS.L, BARC.L, GLEN.L, ABB.SW, ZURN.SW, "
+        "UBSG.SW, LONN.SW, GIVN.SW, SIKA.SW, ADEN.SW, HOLN.SW, DHL.DE, DTE.DE, MUV2.DE, RWE.DE, "
+        "IFX.DE, HEN3.DE, EON.DE, HEI.DE, MTX.DE, BEI.DE, ADS.DE, DB1.DE, SY1.DE, VOW3.DE, "
+        "BNP.PA, SAN.PA, DG.PA, SAF.PA, SGO.PA, ENGI.PA, BN.PA, CA.PA, VIE.PA, VIV.PA, "
+        "EDF.PA, ORP.PA, ACA.PA, GLE.PA, SW.PA, ML.PA, RI.PA, BBVA.MC, TEF.MC, AMS.MC, "
+        "REE.MC, FER.MC, NAT.MC, ENGI.MI, PRY.MI, SRG.MI, TRN.MI, STLAM.MI, MONC.MI, G.MI, "
+        "TEN.MI, CPR.MI, INGA.AS, AD.AS, PRX.AS, REN.AS, HEIA.AS, AKZA.AS, KPN.AS, WKL.AS, "
+        "DSY.PA, UMG.AS, DSM.AS, GALP.LS, EDPR.LS, JMT.LS, NOVO-B.CO, DSV.CO, ORSTED.CO, MAERSK-B.CO, "
+        "COLO-B.CO, VWS.CO, NOBI.ST, VOLV-B.ST, ERIC-B.ST, SEB-A.ST, SAND.ST, HM-B.ST, SWED-A.ST, INVE-B.ST, "
+        "TEL2-B.ST, SKA-B.ST, EQNR.OL, DNB.OL, TEL.OL, MOWI.OL, NHY.OL, STB.OL, FORTUM.HE, NESTE.HE, "
+        "UPM.HE, SAMPO.HE, KNEBV.HE, NOKIA.HE, METSO.HE, STERV.HE, BA.L, RR.L, CCH.L, EXPN.L, "
+        "NG.L, PRU.L, LGEN.L, AV.L, SSE.L, NWG.L, LLCB.L, STAN.L, AAL.L, ANTO.L, "
+        "WPP.L, REL.L, IAG.L, FLTR.L, ENT.L, ABF.L, TSCO.L, SBRY.L, JD.L, NEXT.L, "
+        "CPG.L, WTG.L, RMV.L, AUTO.L, HL.L, INFO.L, ADM.L, RSA.L, DPH.L, HIK.L, "
+        "SHP.L, BT-A.L, SKY.L, LAND.L, BLND.L, SEGRO.L, UTG.L, OCDO.L, BME.L, PNN.L, "
+        "SVT.L, UU.L, SMIN.L, FEV.L, HLMA.L, SPX.L, WEIR.L, IMI.L, SDR.L, ABDN.L"
+    )
+    
+    return [t.strip() for t in tickers_str.split(",")]
+
+# --- PHASE 1: GET TICKERS & VALIDATE ---
+tickers = get_manual_stoxx_200()
+print(f"Phase 1: Validating {len(tickers)} European Tickers and fetching Market Caps...")
+
+cap_list = []
+for t in tickers:
+    try:
+        stock = yf.Ticker(t)
+        m_cap = stock.info.get('marketCap', 0)
+        
+        if m_cap > 0:
+            cap_list.append({'Ticker': t, 'MarketCap': m_cap})
+            print(f"Success: {t} | Cap: {m_cap:,}")
+        else:
+            print(f"Verified (No Cap): {t}")
+    except Exception:
+        print(f"FAILED fetch for: {t}")
+
+# Sort by Market Cap (Highest to Lowest)
+sorted_df = pd.DataFrame(cap_list)
+if not sorted_df.empty:
+    sorted_df = sorted_df.sort_values(by='MarketCap', ascending=False)
+    ordered_tickers = sorted_df['Ticker'].tolist()
+else:
+    print("No valid data found.")
+    exit()
+
+# --- PHASE 2: DOWNLOAD HISTORICAL DATA ---
+print(f"\nPhase 2: Downloading Daily Data for {len(ordered_tickers)} stocks...")
+start = "1976-01-01"
+end = "2026-03-21" 
+
+data = yf.download(ordered_tickers, start=start, end=end, auto_adjust=True)
+
+if isinstance(data.columns, pd.MultiIndex):
+    close_data = data['Close']
+else:
+    close_data = data
+
+valid_tickers = [t for t in ordered_tickers if t in close_data.columns]
+close_data = close_data[valid_tickers]
+
+# --- PHASE 3: EXPORT ---
+df_wide = close_data.transpose()
+df_wide.columns = pd.to_datetime(df_wide.columns).strftime('%Y-%m-%d')
+
+file_name = f"Stoxx200_Manual_Completeness_{len(valid_tickers)}.csv"
+df_wide.to_csv(file_name)
+
+print("-" * 30)
+print(f"Done! Exported {len(valid_tickers)} stocks to {file_name}")
