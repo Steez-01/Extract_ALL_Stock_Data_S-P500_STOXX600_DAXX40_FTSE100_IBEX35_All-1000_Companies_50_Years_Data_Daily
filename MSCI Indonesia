@@ -1,1 +1,88 @@
-MSCI Indonesia
+import pandas as pd
+import yfinance as yf
+import ssl
+import urllib.request
+import io
+
+# --- BYPASS SSL CERTIFICATE ISSUES ---
+ssl._create_default_https_context = ssl._create_unverified_context
+
+def get_indonesia_complete_list():
+    """
+    Targets LQ45 and EIDO components, ensuring prefixes like 'IDX:' are stripped.
+    """
+    url = "https://en.wikipedia.org/wiki/LQ45"
+    headers = {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)'}
+    
+    raw_tickers = []
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req) as response:
+            tables = pd.read_html(io.BytesIO(response.read()))
+            df = next(t for t in tables if any('Ticker' in str(col) or 'Code' in str(col) for col in t.columns))
+            code_col = [col for col in df.columns if 'Ticker' in str(col) or 'Code' in str(col)][0]
+            raw_tickers = df[code_col].astype(str).tolist()
+    except Exception as e:
+        print(f"Auto-fetch failed: {e}")
+
+    # Manual Additions for ETF coverage (EIDO/MSCI)
+    etf_additions = [
+        "BBCA", "BBRI", "BMRI", "TLKM", "ASII", "BBNI", "BYAN", "AMMN", "TPIA", 
+        "MAPI", "MAPA", "MYOR", "CPIN", "EXCL", "ISAT", "BUKA", "ESSA", "MEDC", 
+        "HRUM", "CTRA", "PWON", "BSDE", "SMRA", "JSMR", "AVIA", "BELI", "MTEL", "TOWR",
+        "ADRO", "ANTM", "INCO", "UNTR", "KLBF", "UNVR", "ICBP", "INDF", "INKP"
+    ]
+    
+    combined = list(set(raw_tickers + etf_additions))
+    
+    # --- CLEANING STEP: Remove 'IDX:' and add '.JK' ---
+    clean_tickers = []
+    for t in combined:
+        clean = t.upper().replace("IDX:", "").strip()
+        if not clean.endswith(".JK"):
+            clean += ".JK"
+        clean_tickers.append(clean)
+        
+    return list(set(clean_tickers))
+
+# --- PHASE 1: GET TICKERS & VALIDATE ---
+tickers = get_indonesia_complete_list()
+print(f"Phase 1: Validating {len(tickers)} Indonesia Tickers (Sanitized)...")
+
+cap_list = []
+for t in tickers:
+    try:
+        stock = yf.Ticker(t)
+        m_cap = stock.info.get('marketCap', 0)
+        if m_cap > 0:
+            cap_list.append({'Ticker': t, 'MarketCap': m_cap})
+            print(f"Success: {t} | Cap: Rp{m_cap:,.0f}")
+        else:
+            # Fallback for stocks that have data but no 'info' cap
+            hist = stock.history(period="1d")
+            if not hist.empty:
+                cap_list.append({'Ticker': t, 'MarketCap': 0})
+                print(f"Success (History Only): {t}")
+    except:
+        continue
+
+# Sort by Market Cap
+sorted_df = pd.DataFrame(cap_list).sort_values(by='MarketCap', ascending=False)
+ordered_tickers = sorted_df['Ticker'].tolist()
+
+# --- PHASE 2: DOWNLOAD HISTORICAL DATA ---
+print(f"\nPhase 2: Downloading Daily Data for {len(ordered_tickers)} stocks...")
+start, end = "1976-01-01", "2026-03-21"
+data = yf.download(ordered_tickers, start=start, end=end, auto_adjust=True)
+
+close_data = data['Close'] if isinstance(data.columns, pd.MultiIndex) else data
+
+# --- PHASE 3: EXPORT ---
+df_wide = close_data.transpose()
+df_wide.columns = pd.to_datetime(df_wide.columns).strftime('%Y-%m-%d')
+
+file_name = f"Indonesia_ETF_Full_Sanitized_{len(ordered_tickers)}.csv"
+df_wide.to_csv(file_name)
+
+print("-" * 30)
+print(f"Done! Exported {len(ordered_tickers)} stocks to {file_name}")
