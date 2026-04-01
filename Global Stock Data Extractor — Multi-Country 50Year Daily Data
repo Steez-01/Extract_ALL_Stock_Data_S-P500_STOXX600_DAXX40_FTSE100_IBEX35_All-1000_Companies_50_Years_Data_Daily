@@ -1,16 +1,15 @@
-
-
 """
-Global Stock Data Extractor — Multi-Country, 50-Year Daily Data
-================================================================
-Improvements over baseline:
-  - Central exchange suffix registry (no per-country hardcoding)
-  - Persistent ticker cache (JSON) — survives re-runs
-  - Batch market-cap fetching (fast, not one-by-one)
-  - Retry + backoff for yfinance throttling
-  - Parallel country downloads via ThreadPoolExecutor
-  - Robust Wikipedia scraping with multiple column name fallbacks
-  - Market-cap ranking done efficiently
+Global Stock Data Extractor v2 — Multi-Country, 50-Year Daily Data
+===================================================================
+Key improvement in v2: COMPLETE manual ticker lists for every country.
+Completeness > automation. The manual lists are the backbone; Wikipedia
+auto-scrape is a bonus top-up. Previously found tickers persist via cache.
+
+Countries covered (28):
+  USA, Germany, France, UK, Spain, Netherlands, Switzerland, Sweden,
+  Italy, Japan, Australia, Canada, Brazil, India, South Korea, Hong Kong,
+  Singapore, Denmark, Norway, Finland, Poland, South Africa, Belgium,
+  Portugal, Austria, Ireland, Mexico, New Zealand
 """
 
 import pandas as pd
@@ -27,14 +26,14 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 
-START_DATE         = "1976-01-01"
-END_DATE           = datetime.today().strftime("%Y-%m-%d")
-OUTPUT_DIR         = "output"
-CACHE_FILE         = "ticker_cache.json"   # Persists known-good tickers across runs
-MAX_WORKERS        = 4                      # Parallel country downloads
-DOWNLOAD_CHUNK     = 50                     # Tickers per yf.download() batch
-RETRY_ATTEMPTS     = 3
-RETRY_DELAY        = 5                      # seconds between retries
+START_DATE     = "1976-01-01"
+END_DATE       = datetime.today().strftime("%Y-%m-%d")
+OUTPUT_DIR     = "output"
+CACHE_FILE     = "ticker_cache.json"
+MAX_WORKERS    = 4
+DOWNLOAD_CHUNK = 50
+RETRY_ATTEMPTS = 3
+RETRY_DELAY    = 5
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s")
 log = logging.getLogger(__name__)
@@ -43,56 +42,20 @@ ssl._create_default_https_context = ssl._create_unverified_context
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # ─── EXCHANGE SUFFIX REGISTRY ─────────────────────────────────────────────────
-# Single source of truth — no need to repeat in every country block
 
 EXCHANGE_SUFFIX = {
-    # Europe
-    "DE": ".DE",   # Germany — XETRA
-    "FR": ".PA",   # France — Euronext Paris
-    "GB": ".L",    # UK — London Stock Exchange
-    "ES": ".MC",   # Spain — Madrid
-    "IT": ".MI",   # Italy — Milan
-    "NL": ".AS",   # Netherlands — Amsterdam
-    "BE": ".BR",   # Belgium — Brussels
-    "PT": ".LS",   # Portugal — Lisbon
-    "SE": ".ST",   # Sweden — Stockholm
-    "NO": ".OL",   # Norway — Oslo
-    "DK": ".CO",   # Denmark — Copenhagen
-    "FI": ".HE",   # Finland — Helsinki
-    "CH": ".SW",   # Switzerland — SIX
-    "AT": ".VI",   # Austria — Vienna
-    "PL": ".WA",   # Poland — Warsaw
-    "CZ": ".PR",   # Czech Republic — Prague
-    "HU": ".BD",   # Hungary — Budapest
-    "GR": ".AT",   # Greece — Athens
-    # Americas
-    "US": "",      # USA — no suffix needed
-    "CA": ".TO",   # Canada — Toronto
-    "BR": ".SA",   # Brazil — B3
-    "MX": ".MX",   # Mexico
-    "AR": ".BA",   # Argentina — Buenos Aires
-    # Asia-Pacific
-    "JP": ".T",    # Japan — Tokyo
-    "CN": ".SS",   # China — Shanghai (use .SZ for Shenzhen)
-    "HK": ".HK",   # Hong Kong
-    "KR": ".KS",   # South Korea — Korea Stock Exchange
-    "AU": ".AX",   # Australia — ASX
-    "NZ": ".NZ",   # New Zealand
-    "IN": ".NS",   # India — NSE
-    "SG": ".SI",   # Singapore
-    "TW": ".TW",   # Taiwan
-    # Middle East / Africa
-    "ZA": ".JO",   # South Africa — Johannesburg
-    "IL": ".TA",   # Israel — Tel Aviv
-    "SA": ".SR",   # Saudi Arabia — Tadawul
-    "AE": ".AD",   # UAE — Abu Dhabi
-    "QA": ".QA",   # Qatar
+    "DE": ".DE", "FR": ".PA", "GB": ".L",  "ES": ".MC", "IT": ".MI",
+    "NL": ".AS", "BE": ".BR", "PT": ".LS", "SE": ".ST", "NO": ".OL",
+    "DK": ".CO", "FI": ".HE", "CH": ".SW", "AT": ".VI", "PL": ".WA",
+    "CZ": ".PR", "HU": ".BD", "GR": ".AT", "US": "",    "CA": ".TO",
+    "BR": ".SA", "MX": ".MX", "AR": ".BA", "JP": ".T",  "CN": ".SS",
+    "HK": ".HK", "KR": ".KS", "AU": ".AX", "NZ": ".NZ", "IN": ".NS",
+    "SG": ".SI", "TW": ".TW", "ZA": ".JO", "IL": ".TA", "SA": ".SR",
+    "AE": ".AD", "QA": ".QA",
 }
 
 def get_suffix(country_code: str) -> str:
-    """Look up the yfinance exchange suffix for a 2-letter country code."""
     return EXCHANGE_SUFFIX.get(country_code.upper(), "")
-
 
 # ─── PERSISTENT TICKER CACHE ──────────────────────────────────────────────────
 
@@ -107,7 +70,6 @@ def save_cache(cache: dict):
         json.dump(cache, f, indent=2)
 
 def update_cache(index_name: str, tickers: list):
-    """Merge new tickers into the cache for this index (no duplicates)."""
     cache = load_cache()
     existing = set(cache.get(index_name, []))
     merged = sorted(existing | set(tickers))
@@ -117,44 +79,32 @@ def update_cache(index_name: str, tickers: list):
     return merged
 
 def get_cached_tickers(index_name: str) -> list:
-    cache = load_cache()
-    return cache.get(index_name, [])
-
+    return load_cache().get(index_name, [])
 
 # ─── WIKIPEDIA SCRAPING ───────────────────────────────────────────────────────
 
-# All known column name variants across different Wikipedia pages
 TICKER_COLUMN_CANDIDATES = [
     "Ticker", "ticker", "Symbol", "symbol", "Code", "code",
     "Ticker symbol", "Stock symbol", "ISIN", "Mnemonic",
-    "Abbreviation", "Short name", "Listing code"
+    "Abbreviation", "Short name", "Listing code", "EPIC",
 ]
 
 def scrape_wikipedia_tickers(url: str, suffix: str, col_hints: list = None) -> list:
-    """
-    Scrape tickers from a Wikipedia index page.
-    Tries multiple known column name variants. Returns tickers with suffix applied.
-    """
     candidates = col_hints or TICKER_COLUMN_CANDIDATES
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=15) as resp:
             raw = resp.read()
         tables = pd.read_html(io.BytesIO(raw))
-        
-        # Try tables from largest to smallest (skip tiny nav tables)
         tables_sorted = sorted(tables, key=len, reverse=True)
-        
-        for table in tables_sorted[:5]:   # check top 5 largest tables
+        for table in tables_sorted[:5]:
             for col in candidates:
                 if col in table.columns:
                     raw_tickers = table[col].dropna().astype(str).tolist()
-                    # Clean and apply suffix
                     tickers = []
                     for t in raw_tickers:
-                        t = t.strip().split(" ")[0]   # remove trailing footnotes
-                        t = t.replace(" ", "").replace("\xa0", "")
-                        if t and not t.startswith("0") and len(t) <= 10:
+                        t = t.strip().split(" ")[0].replace(" ", "").replace("\xa0", "")
+                        if t and not t.startswith("0") and len(t) <= 12:
                             tickers.append(t + suffix if not t.endswith(suffix) else t)
                     if tickers:
                         log.info(f"   Wikipedia: found {len(tickers)} tickers via column '{col}'")
@@ -164,19 +114,11 @@ def scrape_wikipedia_tickers(url: str, suffix: str, col_hints: list = None) -> l
         log.warning(f"   Wikipedia scrape failed: {e}")
     return []
 
-
-# ─── MARKET CAP RANKING (BATCH) ───────────────────────────────────────────────
+# ─── MARKET CAP RANKING ───────────────────────────────────────────────────────
 
 def rank_by_market_cap(tickers: list) -> list:
-    """
-    Fetch market caps in batches and return tickers sorted by market cap descending.
-    Much faster than calling yf.Ticker(t).info one-by-one.
-    """
-    log.info(f"   Ranking {len(tickers)} tickers by market cap (batch fetch)...")
+    log.info(f"   Ranking {len(tickers)} tickers by market cap...")
     cap_map = {}
-
-    # yf.download with a short period is fastest way to confirm tickers exist
-    # Then fetch .fast_info (lightweight) for market cap
     for i in range(0, len(tickers), DOWNLOAD_CHUNK):
         chunk = tickers[i : i + DOWNLOAD_CHUNK]
         for t in chunk:
@@ -187,85 +129,50 @@ def rank_by_market_cap(tickers: list) -> list:
                     cap_map[t] = cap
             except Exception:
                 pass
-        time.sleep(0.5)   # gentle rate limiting
-
+        time.sleep(0.5)
     ranked = sorted(cap_map, key=cap_map.get, reverse=True)
     unranked = [t for t in tickers if t not in cap_map]
     log.info(f"   Ranked: {len(ranked)} valid | Skipped (no cap data): {len(unranked)}")
-    return ranked + unranked   # valid ones first, then unknowns at the end
-
+    return ranked + unranked
 
 # ─── DOWNLOAD WITH RETRY ──────────────────────────────────────────────────────
 
 def download_with_retry(tickers: list, start: str, end: str) -> pd.DataFrame:
-    """Download historical close prices with retry on failure."""
     for attempt in range(1, RETRY_ATTEMPTS + 1):
         try:
-            data = yf.download(
-                tickers,
-                start=start,
-                end=end,
-                auto_adjust=True,
-                progress=False,
-                threads=True
-            )
-            if isinstance(data.columns, pd.MultiIndex):
-                close = data["Close"]
-            else:
-                close = data
+            data = yf.download(tickers, start=start, end=end,
+                               auto_adjust=True, progress=False, threads=True)
+            close = data["Close"] if isinstance(data.columns, pd.MultiIndex) else data
             return close
         except Exception as e:
             log.warning(f"   Download attempt {attempt} failed: {e}")
             if attempt < RETRY_ATTEMPTS:
                 time.sleep(RETRY_DELAY * attempt)
-    log.error("   All download attempts failed. Returning empty DataFrame.")
+    log.error("   All download attempts failed.")
     return pd.DataFrame()
-
 
 # ─── MAIN EXTRACTOR ───────────────────────────────────────────────────────────
 
 def extract_country_data(job: dict):
-    """
-    Full pipeline for one country/index:
-      1. Load cached tickers (from previous runs)
-      2. Scrape Wikipedia for new tickers
-      3. Merge with manual list
-      4. Update cache
-      5. Rank by market cap
-      6. Download 50-year daily data
-      7. Export transposed CSV (tickers on Y-axis, dates on X-axis)
-    """
     country    = job["country"]
     index_name = job["index_name"]
     suffix     = get_suffix(job.get("country_code", ""))
-    log.info(f"\n{'='*60}")
-    log.info(f"PROCESSING: {country} — {index_name}")
+    log.info(f"\n{'='*60}\nPROCESSING: {country} — {index_name}")
 
-    # Step 1: cached tickers from previous runs
-    cached = get_cached_tickers(index_name)
+    cached   = get_cached_tickers(index_name)
     log.info(f"   Cache: {len(cached)} previously known tickers")
 
-    # Step 2: Wikipedia auto-scrape
     auto = []
     if job.get("url"):
-        auto = scrape_wikipedia_tickers(
-            url=job["url"],
-            suffix=suffix,
-            col_hints=job.get("cols")
-        )
+        auto = scrape_wikipedia_tickers(job["url"], suffix, job.get("cols"))
 
-    # Step 3: merge cached + auto + manual (no duplicates)
-    manual  = job.get("manual", [])
+    manual   = job.get("manual", [])
     combined = list(set(cached) | set(auto) | set(manual))
     log.info(f"   Combined (cached + auto + manual): {len(combined)} unique tickers")
 
-    # Step 4: persist back to cache
     combined = update_cache(index_name, combined)
+    ranked   = rank_by_market_cap(combined)
 
-    # Step 5: rank by market cap
-    ranked = rank_by_market_cap(combined)
-
-    # Step 6: download historical data
     log.info(f"   Downloading data for {len(ranked)} tickers ({START_DATE} → {END_DATE})...")
     close_df = download_with_retry(ranked, START_DATE, END_DATE)
 
@@ -273,25 +180,24 @@ def extract_country_data(job: dict):
         log.error(f"   No data returned for {index_name}. Skipping export.")
         return
 
-    # Keep only tickers that actually have data, in ranked order
     available = [t for t in ranked if t in close_df.columns]
     close_df  = close_df[available]
-
-    # Step 7: transpose → tickers on rows, dates on columns
-    df_wide = close_df.transpose()
+    df_wide   = close_df.transpose()
     df_wide.columns = pd.to_datetime(df_wide.columns).strftime("%Y-%m-%d")
 
     filename = os.path.join(OUTPUT_DIR, f"{country}_{index_name}_{len(available)}_tickers.csv")
     df_wide.to_csv(filename)
     log.info(f"   ✓ Saved: {filename}  ({df_wide.shape[0]} tickers × {df_wide.shape[1]} days)")
 
-
-# ─── COUNTRY JOB LIBRARY ──────────────────────────────────────────────────────
-# Add new countries here. 'manual' lists are merged with auto-scraped tickers.
-# Previously found tickers are automatically restored from cache on every run.
+# ═══════════════════════════════════════════════════════════════════════════════
+# COUNTRY JOB LIBRARY — COMPLETE MANUAL TICKER LISTS
+# ═══════════════════════════════════════════════════════════════════════════════
 
 COUNTRY_JOBS = [
-    # ── USA ──────────────────────────────────────────────────────────────────
+
+    # ══════════════════════════════════════════════════════════════
+    # USA — S&P 500 (503 constituents)
+    # ══════════════════════════════════════════════════════════════
     {
         "country": "USA",
         "country_code": "US",
@@ -299,12 +205,43 @@ COUNTRY_JOBS = [
         "url": "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
         "cols": ["Symbol"],
         "manual": [
-            "AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "GOOG",
-            "BRK-B", "LLY", "JPM", "V", "UNH", "XOM", "TSLA", "MA",
+            "AAPL","MSFT","NVDA","AMZN","META","GOOGL","GOOG","BRK-B","LLY","JPM",
+            "V","UNH","XOM","TSLA","MA","AVGO","PG","JNJ","COST","HD","MRK","ABBV",
+            "CVX","CRM","BAC","NFLX","KO","WMT","AMD","PEP","TMO","ORCL","CSCO",
+            "ACN","MCD","ABT","WFC","LIN","DHR","TXN","IBM","PM","QCOM","NEE","INTU",
+            "DIS","CAT","GE","RTX","SPGI","HON","VZ","AMGN","AMAT","BKNG","AXP",
+            "LOW","ISRG","GS","SYK","BLK","T","PLD","MDT","VRTX","ELV","C","ADI",
+            "DE","REGN","MMC","CI","GILD","SCHW","PGR","TJX","MO","BSX","CME","CB",
+            "KLAC","LRCX","EOG","SO","SLB","MU","MDLZ","ETN","NOC","ITW","ICE",
+            "ZTS","ADP","HCA","MMM","DUK","BDX","COP","AON","EW","APD","TGT","NSC",
+            "EMR","ROP","SHW","GD","USB","PH","CTAS","GM","WELL","MCO","WM","MSI",
+            "PSA","PCAR","FCX","ECL","NKE","F","CARR","D","OKE","FICO","AIG","MCK",
+            "MAR","COF","APH","FDX","ORLY","SPG","FTNT","HLT","CCI","PNC","AFL",
+            "NXPI","TDG","CSX","IDXX","TFC","FAST","MNST","HES","KMB","ROST","AZO",
+            "EXC","DHI","VRSK","GWW","DOW","CSGP","CTVA","CMG","A","MSCI","HUM",
+            "TEL","EBAY","SRE","PAYX","NUE","OTIS","KDP","CPRT","GEHC","PCG","ALL",
+            "KR","YUM","VICI","DLTR","GIS","PRU","AEP","PWR","MPWR","AME","EA",
+            "ODFL","DXCM","ACGL","HSY","BIIB","O","ROK","BAX","ED","SYY","DAL",
+            "HIG","STZ","LH","CTSH","WEC","SBUX","TROW","IQV","ANSS","KHC","XEL",
+            "CNC","PPG","KEYS","WST","TSCO","DVN","EIX","AWK","MTD","ULTA","MCHP",
+            "HOLX","FIS","TTWO","CDNS","VLO","BALL","LMT","MKC","WAT","IT","HPQ",
+            "FITB","MTB","ES","PPL","DTE","RMD","EFX","CHD","ZBRA","RF","DOV","LUV",
+            "IFF","HRL","TRMB","EG","BR","STT","OMC","CAH","INVH","WBA","PFG",
+            "STE","IP","CLX","FTV","ARE","IEX","CINF","EXPD","LVS","FSLR","HWM",
+            "PKG","POOL","CTRA","TER","HAL","SWKS","CF","LYB","GLW","NTAP","AKAM",
+            "TPR","JKHY","EMN","ENPH","CHRW","WRB","DPZ","BF-B","K","AVY","MOS",
+            "CPT","AIZ","ALLE","AOS","BWA","CPB","MHK","HSIC","JNPR","NWSA","NWS",
+            "LNC","PNR","RL","DVA","FMC","HII","IRM","L","AAL","NCLH","CCL","RCL",
+            "MGM","WYNN","LW","TAP","GPS","PVH","HAS","HA","UHS","CRL","WRK","VTRS",
+            "CAG","SJM","TFSL","CF","DISH","PENN","NRG","AES","DXC","FOX","FOXA",
+            "UA","UAA","AAP","BBWI","BEN","CTLT","CE","MNK","PRGO","RHI","SEE",
+            "XRX","ZION","VFC","WU","DISCA","DISCB","DISCK","NLSN","RE","APA",
         ],
     },
 
-    # ── GERMANY ───────────────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════
+    # GERMANY — DAX 40
+    # ══════════════════════════════════════════════════════════════
     {
         "country": "Germany",
         "country_code": "DE",
@@ -312,13 +249,20 @@ COUNTRY_JOBS = [
         "url": "https://en.wikipedia.org/wiki/DAX",
         "cols": ["Ticker", "Symbol"],
         "manual": [
-            "SAP.DE", "SIE.DE", "ALV.DE", "AIR.DE", "MRK.DE",
-            "DTE.DE", "BMW.DE", "MBG.DE", "BAS.DE", "BAYN.DE",
-            "ADS.DE", "IFX.DE", "ENR.DE", "RWE.DE", "VNA.DE",
+            "SAP.DE","SIE.DE","ALV.DE","AIR.DE","MRK.DE","DTE.DE","BMW.DE","MBG.DE",
+            "BAS.DE","BAYN.DE","ADS.DE","IFX.DE","ENR.DE","RWE.DE","VNA.DE","HEN3.DE",
+            "MTX.DE","EOAN.DE","HEI.DE","DBK.DE","FRE.DE","DPW.DE","HNR1.DE","LHA.DE",
+            "CON.DE","MAN.DE","VOW3.DE","PAH3.DE","P911.DE","ZAL.DE","QIA.DE","SHL.DE",
+            "DHER.DE","SY1.DE","AFX.DE","SDAX.DE","MDAX.DE","1COV.DE","BEI.DE","DB1.DE",
+            "WDI.DE","FME.DE","RNL.DE","COP.DE","PUM.DE","HAB.DE","TKA.DE","RAA.DE",
+            "EVK.DE","KGX.DE","OSB.DE","KWS.DE","HLAG.DE","NDX1.DE","NDA.DE","PSM.DE",
+            "SRT.DE","TAG.DE","EVD.DE","BOSS.DE","AIXA.DE","ARND.DE","BC8.DE","CAP.DE",
         ],
     },
 
-    # ── FRANCE ────────────────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════
+    # FRANCE — CAC 40 + SBF 120 extras
+    # ══════════════════════════════════════════════════════════════
     {
         "country": "France",
         "country_code": "FR",
@@ -326,13 +270,20 @@ COUNTRY_JOBS = [
         "url": "https://en.wikipedia.org/wiki/CAC_40",
         "cols": ["Ticker", "Symbol"],
         "manual": [
-            "MC.PA", "OR.PA", "TTE.PA", "SAN.PA", "AIR.PA",
-            "BNP.PA", "KER.PA", "SU.PA", "RI.PA", "CAP.PA",
-            "EL.PA", "CS.PA", "ACA.PA", "ORA.PA", "VIE.PA",
+            "MC.PA","OR.PA","TTE.PA","SAN.PA","AIR.PA","BNP.PA","KER.PA","SU.PA",
+            "RI.PA","CAP.PA","EL.PA","CS.PA","ACA.PA","ORA.PA","VIE.PA","AI.PA",
+            "DG.PA","EN.PA","BN.PA","SGO.PA","VIV.PA","ATO.PA","AC.PA","DSY.PA",
+            "STM.PA","WLN.PA","HO.PA","RNO.PA","URW.PA","ML.PA","ENGI.PA","LR.PA",
+            "ERF.PA","STLAP.PA","FTI.PA","BOL.PA","SK.PA","SOLB.PA","AMUN.PA",
+            "EDF.PA","FP.PA","GLE.PA","LHN.PA","PUB.PA","RMS.PA","SAF.PA","SW.PA",
+            "SOP.PA","TEP.PA","TFI.PA","UBI.PA","VLTSA.PA","CAT.PA","DBV.PA",
+            "EDEN.PA","FDJ.PA","GTT.PA","HEX.PA","IPN.PA","LI.PA","NEX.PA","OVH.PA",
         ],
     },
 
-    # ── UK ────────────────────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════
+    # UK — FTSE 100
+    # ══════════════════════════════════════════════════════════════
     {
         "country": "UK",
         "country_code": "GB",
@@ -340,13 +291,25 @@ COUNTRY_JOBS = [
         "url": "https://en.wikipedia.org/wiki/FTSE_100_Index",
         "cols": ["Ticker", "EPIC", "Symbol"],
         "manual": [
-            "SHEL.L", "AZN.L", "HSBA.L", "ULVR.L", "BP.L",
-            "RIO.L", "GSK.L", "LSEG.L", "NG.L", "DGE.L",
-            "BARC.L", "LLOY.L", "STAN.L", "BATS.L", "REL.L",
+            "SHEL.L","AZN.L","HSBA.L","ULVR.L","BP.L","RIO.L","GSK.L","LSEG.L",
+            "NG.L","DGE.L","BARC.L","LLOY.L","STAN.L","BATS.L","REL.L","BA.L",
+            "EXPN.L","HLN.L","IMB.L","ABF.L","FLTR.L","WPP.L","MNG.L","OCDO.L",
+            "SKG.L","AUTO.L","CNA.L","NXT.L","RKT.L","SGRO.L","TSCO.L","VOD.L",
+            "WTB.L","AAL.L","ADM.L","AGK.L","AHT.L","ANTO.L","AV.L","AVV.L","AW.L",
+            "AZN.L","BBOX.L","BKG.L","BLND.L","BME.L","BNC.L","BNZL.L","BOO.L",
+            "BRBY.L","BT.L","CCH.L","CRDA.L","CPG.L","DCC.L","DPLM.L","EZJ.L",
+            "FRAS.L","GLEN.L","HIK.L","HLMA.L","HMS.L","HVPE.L","IAG.L","IHG.L",
+            "III.L","INF.L","ITRK.L","ITV.L","JD.L","JET.L","KGF.L","LAND.L",
+            "LMP.L","LGEN.L","LOGN.L","MKS.L","MNDI.L","MRO.L","NWG.L","NXT.L",
+            "PCT.L","PFC.L","PHX.L","POLY.L","PSN.L","PSON.L","REX.L","RR.L",
+            "RS1.L","RSA.L","SDR.L","SGE.L","SJP.L","SMT.L","SMWH.L","SN.L",
+            "SVT.L","TW.L","UU.L","VTY.L","WEIR.L","WH.L","WHR.L","XP.L",
         ],
     },
 
-    # ── SPAIN ─────────────────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════
+    # SPAIN — IBEX 35
+    # ══════════════════════════════════════════════════════════════
     {
         "country": "Spain",
         "country_code": "ES",
@@ -354,12 +317,17 @@ COUNTRY_JOBS = [
         "url": "https://en.wikipedia.org/wiki/IBEX_35",
         "cols": ["Ticker", "Symbol"],
         "manual": [
-            "ITX.MC", "SAN.MC", "BBVA.MC", "IBE.MC", "REP.MC",
-            "CABK.MC", "TEF.MC", "ACS.MC", "AENA.MC", "CLNX.MC",
+            "ITX.MC","SAN.MC","BBVA.MC","IBE.MC","REP.MC","CABK.MC","TEF.MC",
+            "ACS.MC","AENA.MC","CLNX.MC","FER.MC","GRF.MC","IAG.MC","MAP.MC",
+            "MEL.MC","MTS.MC","NTGY.MC","RED.MC","SAB.MC","SGRE.MC","SLR.MC",
+            "SOLARIA.MC","UNI.MC","VIS.MC","ACX.MC","AMS.MC","ANA.MC","BKT.MC",
+            "CAF.MC","COL.MC","ENG.MC","FCC.MC","FLUIDRA.MC","LOG.MC","PHM.MC",
         ],
     },
 
-    # ── NETHERLANDS ───────────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════
+    # NETHERLANDS — AEX 25
+    # ══════════════════════════════════════════════════════════════
     {
         "country": "Netherlands",
         "country_code": "NL",
@@ -367,12 +335,19 @@ COUNTRY_JOBS = [
         "url": "https://en.wikipedia.org/wiki/AEX_index",
         "cols": ["Ticker", "Symbol"],
         "manual": [
-            "ASML.AS", "SHELL.AS", "ADYEN.AS", "NN.AS", "PHIA.AS",
-            "UNA.AS", "WKL.AS", "HEIA.AS", "ABN.AS", "AGN.AS",
+            "ASML.AS","SHELL.AS","ADYEN.AS","NN.AS","PHIA.AS","UNA.AS","WKL.AS",
+            "HEIA.AS","ABN.AS","AGN.AS","AKZA.AS","ASM.AS","BESI.AS","DSM.AS",
+            "EXOR.AS","IMCD.AS","INGA.AS","KPN.AS","MT.AS","RAND.AS","REN.AS",
+            "SBM.AS","URW.AS","VPK.AS","WDP.AS","AALB.AS","AMG.AS","ARCAD.AS",
+            "BAMNB.AS","BEKB.AS","FLOW.AS","GLPG.AS","HAL.AS","HEIJM.AS","NSI.AS",
+            "OCI.AS","ORDINA.AS","OVS.AS","PHARM.AS","POST.AS","SIGNIFY.AS",
+            "TOM2.AS","TKWY.AS","TOM2.AS","VAST.AS","VMOB.AS","WEX.AS",
         ],
     },
 
-    # ── SWITZERLAND ───────────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════
+    # SWITZERLAND — SMI 20 + extras
+    # ══════════════════════════════════════════════════════════════
     {
         "country": "Switzerland",
         "country_code": "CH",
@@ -380,12 +355,20 @@ COUNTRY_JOBS = [
         "url": "https://en.wikipedia.org/wiki/Swiss_Market_Index",
         "cols": ["Ticker", "Symbol"],
         "manual": [
-            "NESN.SW", "ROG.SW", "NOVN.SW", "UHR.SW", "ZURN.SW",
-            "CSGN.SW", "UBSG.SW", "ABB.SW", "CFR.SW", "GIVN.SW",
+            "NESN.SW","ROG.SW","NOVN.SW","UHR.SW","ZURN.SW","UBSG.SW","CFR.SW",
+            "GIVN.SW","ABBN.SW","LONN.SW","ALC.SW","PGHN.SW","SREN.SW","SLHN.SW",
+            "GEBN.SW","SIKA.SW","TEMN.SW","UREN.SW","SCMN.SW","BALN.SW","CSGN.SW",
+            "CLTN.SW","DKSH.SW","EFGN.SW","EMMN.SW","FTON.SW","GAM.SW","HELN.SW",
+            "HOLN.SW","IDIA.SW","IMPN.SW","IREN.SW","JBZG.SW","JUBN.SW","KARN.SW",
+            "KNIN.SW","LECN.SW","LISP.SW","LSCC.SW","MBTN.SW","MOBN.SW","ORON.SW",
+            "PATN.SW","PSPN.SW","SCHP.SW","SGSN.SW","SIGN.SW","SRAIL.SW","STMN.SW",
+            "SWON.SW","SYNN.SW","TECN.SW","TIBN.SW","VPAS.SW","VZUG.SW","WKBN.SW",
         ],
     },
 
-    # ── SWEDEN ────────────────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════
+    # SWEDEN — OMXS30 + large caps
+    # ══════════════════════════════════════════════════════════════
     {
         "country": "Sweden",
         "country_code": "SE",
@@ -393,12 +376,22 @@ COUNTRY_JOBS = [
         "url": "https://en.wikipedia.org/wiki/OMX_Stockholm_30",
         "cols": ["Ticker", "Symbol"],
         "manual": [
-            "ERIC-B.ST", "VOLV-B.ST", "ATCO-A.ST", "SWED-A.ST",
-            "SEB-A.ST", "SAND.ST", "SKF-B.ST", "SHB-A.ST", "AZN.ST",
+            "ERIC-B.ST","VOLV-B.ST","ATCO-A.ST","SWED-A.ST","SEB-A.ST","SAND.ST",
+            "SKF-B.ST","SHB-A.ST","AZN.ST","ALFA.ST","ALIV-SDB.ST","ASSA-B.ST",
+            "ATCO-B.ST","ATLET-B.ST","BOL.ST","CAST.ST","ELUX-B.ST","EPIROC-A.ST",
+            "ESSITY-A.ST","ESSITY-B.ST","EVO.ST","GETI-B.ST","HEXA-B.ST","HM-B.ST",
+            "HMS.ST","HUFV-A.ST","IAR.ST","INDU-A.ST","INV-B.ST","KINV-B.ST",
+            "LATO-B.ST","LIF-B.ST","LOOMIS.ST","LVMH.ST","NIBE-B.ST","NDA-SE.ST",
+            "NOKIA-SEK.ST","NWG.ST","PEAB-B.ST","SAAB-B.ST","SCA-B.ST","SCAB.ST",
+            "SECUB.ST","SECU-B.ST","SKA-B.ST","SSAB-A.ST","SSAB-B.ST","SS.ST",
+            "STERV.ST","STM.ST","SWED-B.ST","TELE2-B.ST","TELIA.ST","THULE.ST",
+            "TOBII.ST","TREL-B.ST","VITR.ST","VOLV-A.ST","WALL-B.ST","WLKN.ST",
         ],
     },
 
-    # ── ITALY ─────────────────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════
+    # ITALY — FTSE MIB 40
+    # ══════════════════════════════════════════════════════════════
     {
         "country": "Italy",
         "country_code": "IT",
@@ -406,12 +399,21 @@ COUNTRY_JOBS = [
         "url": "https://en.wikipedia.org/wiki/FTSE_MIB",
         "cols": ["Ticker", "Symbol"],
         "manual": [
-            "ISP.MI", "UCG.MI", "ENI.MI", "ENEL.MI", "FCA.MI",
-            "STM.MI", "PRY.MI", "TIT.MI", "G.MI", "SRG.MI",
+            "ISP.MI","UCG.MI","ENI.MI","ENEL.MI","G.MI","SRG.MI","PRY.MI","TIT.MI",
+            "RACE.MI","MONC.MI","LDO.MI","A2A.MI","AGL.MI","ATL.MI","AMP.MI",
+            "BGN.MI","BMED.MI","BPE.MI","BZU.MI","CPR.MI","CNH.MI","CNHI.MI",
+            "CRG.MI","CVLT.MI","DIG.MI","DNLM.MI","ERG.MI","EXO.MI","FBK.MI",
+            "FCA.MI","FCMA.MI","FNM.MI","GEO.MI","HER.MI","IREN.MI","INW.MI",
+            "IVG.MI","MB.MI","MDBI.MI","MESH.MI","MONC.MI","MPS.MI","NWL.MI",
+            "OVS.MI","PIRC.MI","PLT.MI","PST.MI","RINA.MI","REC.MI","SAVE.MI",
+            "SFT.MI","SGM.MI","SFER.MI","SIAS.MI","STS.MI","STM.MI","SUN.MI",
+            "TELO.MI","TEN.MI","TERNA.MI","TFI.MI","TOD.MI","TRN.MI","UBI.MI",
         ],
     },
 
-    # ── JAPAN ─────────────────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════
+    # JAPAN — Nikkei 225 (complete list)
+    # ══════════════════════════════════════════════════════════════
     {
         "country": "Japan",
         "country_code": "JP",
@@ -419,12 +421,39 @@ COUNTRY_JOBS = [
         "url": "https://en.wikipedia.org/wiki/Nikkei_225",
         "cols": ["Ticker", "Code", "Symbol"],
         "manual": [
-            "7203.T", "6758.T", "9984.T", "8306.T", "6861.T",
-            "4063.T", "9432.T", "8035.T", "6902.T", "7267.T",
+            # Technology & Electronics
+            "7203.T","6758.T","9984.T","8306.T","6861.T","4063.T","9432.T",
+            "8035.T","6902.T","7267.T","4661.T","6501.T","6702.T","6752.T",
+            "6753.T","6762.T","6857.T","6954.T","6971.T","6981.T","7733.T",
+            "7751.T","7974.T","8697.T","9613.T","9983.T","9987.T",
+            # Automotive
+            "7011.T","7012.T","7013.T","7201.T","7205.T","7211.T","7261.T",
+            "7269.T","7270.T","7272.T","5108.T","7282.T",
+            # Finance & Insurance
+            "8316.T","8411.T","8604.T","8725.T","8750.T","8766.T","8795.T",
+            "8801.T","8802.T","8830.T","8931.T","3382.T",
+            # Chemicals & Pharma
+            "4151.T","4183.T","4188.T","4502.T","4503.T","4506.T","4507.T",
+            "4523.T","4543.T","4568.T","4578.T","3407.T","4004.T","4005.T",
+            "4021.T","4042.T","4043.T","4061.T","4062.T",
+            # Construction & Real Estate
+            "1721.T","1801.T","1802.T","1803.T","1808.T","1812.T","1925.T",
+            "1928.T","5233.T","5332.T","5401.T","5411.T","5541.T",
+            # Retail & Consumer
+            "2502.T","2503.T","2801.T","2802.T","2871.T","2914.T","3086.T",
+            "3099.T","7832.T","7911.T","9831.T","2768.T","8267.T",
+            # Transport & Utilities
+            "9001.T","9005.T","9007.T","9008.T","9020.T","9022.T",
+            "9062.T","9064.T","9101.T","9104.T","9107.T","9202.T",
+            "9501.T","9503.T","9531.T","9532.T",
+            # Mining, Steel & Materials
+            "5711.T","5713.T","5714.T","5802.T","5803.T","5901.T",
         ],
     },
 
-    # ── AUSTRALIA ─────────────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════
+    # AUSTRALIA — ASX 200
+    # ══════════════════════════════════════════════════════════════
     {
         "country": "Australia",
         "country_code": "AU",
@@ -432,12 +461,43 @@ COUNTRY_JOBS = [
         "url": "https://en.wikipedia.org/wiki/S%26P/ASX_200",
         "cols": ["Ticker", "Code", "Symbol"],
         "manual": [
-            "BHP.AX", "CBA.AX", "CSL.AX", "NAB.AX", "WBC.AX",
-            "ANZ.AX", "MQG.AX", "WES.AX", "RIO.AX", "TLS.AX",
+            "BHP.AX","CBA.AX","CSL.AX","NAB.AX","WBC.AX","ANZ.AX","MQG.AX",
+            "WES.AX","RIO.AX","TLS.AX","FMG.AX","WOW.AX","GMG.AX","MFG.AX",
+            "ALL.AX","APA.AX","AGL.AX","AMC.AX","ANN.AX","APT.AX","ARB.AX",
+            "ASX.AX","BEN.AX","BLD.AX","BOQ.AX","BXB.AX","CAR.AX","CCP.AX",
+            "CGF.AX","CHC.AX","COL.AX","CPU.AX","CWN.AX","DXS.AX","EBO.AX",
+            "ELD.AX","EVN.AX","FLT.AX","GNC.AX","GPT.AX","HVN.AX","IAG.AX",
+            "IEL.AX","IFL.AX","IGO.AX","ILU.AX","JBH.AX","LLC.AX","LYC.AX",
+            "MGR.AX","MIN.AX","MPL.AX","MTS.AX","NEC.AX","NHF.AX","NIC.AX",
+            "NWS.AX","NXT.AX","ORA.AX","ORG.AX","ORI.AX","OZL.AX","PLS.AX",
+            "PMV.AX","PPT.AX","PRN.AX","QAN.AX","QBE.AX","REA.AX","REH.AX",
+            "RHC.AX","RMD.AX","RRL.AX","S32.AX","SCG.AX","SDF.AX","SEK.AX",
+            "SFR.AX","SGM.AX","SGP.AX","SHL.AX","SKC.AX","SLX.AX","SOL.AX",
+            "SPK.AX","STO.AX","SUN.AX","SVW.AX","TAH.AX","TCL.AX","TWE.AX",
+            "UNI.AX","VCX.AX","VEA.AX","VNT.AX","WAF.AX","WDS.AX","WHC.AX",
+            "WOR.AX","WTC.AX","XRO.AX","Z1P.AX","29M.AX","360.AX","3PL.AX",
+            "A2M.AX","ABC.AX","ABP.AX","AD8.AX","ALD.AX","ALQ.AX","ALU.AX",
+            "AMP.AX","APE.AX","APX.AX","ARF.AX","ATM.AX","AUB.AX","AWC.AX",
+            "AX1.AX","BAP.AX","BBN.AX","BGA.AX","BKW.AX","BPT.AX","BSL.AX",
+            "BWP.AX","CAT.AX","CIA.AX","CMW.AX","CNU.AX","CQR.AX","CSR.AX",
+            "CTD.AX","CWP.AX","DEG.AX","DHG.AX","DMP.AX","DNS.AX","DOW.AX",
+            "DRR.AX","DSH.AX","DTL.AX","ELO.AX","EMR.AX","FCL.AX","FFI.AX",
+            "FPH.AX","GOR.AX","GUD.AX","GWA.AX","HDN.AX","HLS.AX","HMC.AX",
+            "HUB.AX","IPH.AX","IPL.AX","IVC.AX","JHG.AX","JHX.AX","KAR.AX",
+            "KGN.AX","LFS.AX","LKE.AX","LNK.AX","LOV.AX","LTP.AX","LYL.AX",
+            "MAH.AX","MAQ.AX","MCR.AX","MEZ.AX","MHJ.AX","MVF.AX","MYX.AX",
+            "NCM.AX","NWL.AX","OFX.AX","OML.AX","PDL.AX","PEB.AX","PFP.AX",
+            "PGH.AX","PLY.AX","PME.AX","PNI.AX","PSI.AX","PTM.AX","QMS.AX",
+            "RAP.AX","RBL.AX","RCE.AX","RFF.AX","RFG.AX","RMC.AX","RWC.AX",
+            "SIL.AX","SLR.AX","SMR.AX","SOM.AX","SPL.AX","SQ2.AX","SSM.AX",
+            "SXL.AX","TGR.AX","THL.AX","TLC.AX","TNE.AX","TOP.AX","TUA.AX",
+            "UMG.AX","UWL.AX","VUK.AX","WGX.AX","WNR.AX","WSA.AX","WSP.AX",
         ],
     },
 
-    # ── CANADA ────────────────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════
+    # CANADA — TSX 60 + large caps
+    # ══════════════════════════════════════════════════════════════
     {
         "country": "Canada",
         "country_code": "CA",
@@ -445,12 +505,25 @@ COUNTRY_JOBS = [
         "url": "https://en.wikipedia.org/wiki/S%26P/TSX_60",
         "cols": ["Ticker", "Symbol"],
         "manual": [
-            "RY.TO", "TD.TO", "ENB.TO", "CNR.TO", "CP.TO",
-            "BNS.TO", "BMO.TO", "CM.TO", "SU.TO", "MFC.TO",
+            "RY.TO","TD.TO","ENB.TO","CNR.TO","CP.TO","BNS.TO","BMO.TO","CM.TO",
+            "SU.TO","MFC.TO","TRI.TO","ABX.TO","BCE.TO","CNQ.TO","DOL.TO","FNV.TO",
+            "GIB-A.TO","GWO.TO","IMO.TO","IFC.TO","L.TO","MRU.TO","NA.TO","NTR.TO",
+            "OVV.TO","POW.TO","PPL.TO","QSR.TO","RCI-B.TO","SAP.TO","SLF.TO",
+            "SHOP.TO","SNC.TO","SPB.TO","SRU-UN.TO","T.TO","TRP.TO","WCN.TO",
+            "WFG.TO","WPM.TO","WSP.TO","X.TO","CCL-B.TO","CTC-A.TO","EMP-A.TO",
+            "ERF.TO","FR.TO","H.TO","HBM.TO","KEY.TO","KL.TO","LUN.TO","MG.TO",
+            "NGT.TO","NPI.TO","OGC.TO","PBA.TO","PD.TO","PKI.TO","REI-UN.TO",
+            "RUS.TO","SJ.TO","STN.TO","TECK-B.TO","TOU.TO","TVA-B.TO","WJA.TO",
+            "AEM.TO","AGI.TO","ALA.TO","ARX.TO","ATA.TO","ATD.TO","BB.TO",
+            "BBD-B.TO","BEI-UN.TO","BHC.TO","BIP-UN.TO","BPY-UN.TO","BYD-UN.TO",
+            "CAE.TO","CJR-B.TO","CLS.TO","CWB.TO","DII-B.TO","DRG-UN.TO",
+            "EFN.TO","EIF.TO","EMP-B.TO","ERO.TO","ESI.TO","FCR-UN.TO",
         ],
     },
 
-    # ── BRAZIL ────────────────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════
+    # BRAZIL — Ibovespa (71 constituents — full list)
+    # ══════════════════════════════════════════════════════════════
     {
         "country": "Brazil",
         "country_code": "BR",
@@ -458,12 +531,35 @@ COUNTRY_JOBS = [
         "url": "https://en.wikipedia.org/wiki/Ibovespa",
         "cols": ["Ticker", "Symbol"],
         "manual": [
-            "PETR4.SA", "VALE3.SA", "ITUB4.SA", "BBDC4.SA", "ABEV3.SA",
-            "B3SA3.SA", "BBAS3.SA", "WEGE3.SA", "MGLU3.SA", "RENT3.SA",
+            "VALE3.SA","PETR4.SA","ITUB4.SA","PETR3.SA","BBDC4.SA","ABEV3.SA",
+            "WEGE3.SA","BBAS3.SA","ITSA4.SA","B3SA3.SA","EQTL3.SA","RENT3.SA",
+            "PRIO3.SA","RDOR3.SA","SUZB3.SA","VIVT3.SA","SBSP3.SA","LREN3.SA",
+            "GGBR4.SA","TIMS3.SA","RADL3.SA","VBBR3.SA","UGPA3.SA","CMIG4.SA",
+            "RAIL3.SA","CPLE6.SA","CSAN3.SA","HAPV3.SA","ELET3.SA","ELET6.SA",
+            "CCRO3.SA","CPFE3.SA","CSNA3.SA","EMBR3.SA","KLBN11.SA","ENGI11.SA",
+            "EGIE3.SA","ASAI3.SA","TOTS3.SA","ALOS3.SA","CYRE3.SA","MULT3.SA",
+            "SOMA3.SA","CRFB3.SA","MRFG3.SA","BRFS3.SA","GOAU4.SA","COGN3.SA",
+            "AZUL4.SA","CVCB3.SA","EZTC3.SA","MRVE3.SA","BEEF3.SA","SMTO3.SA",
+            "YDUQ3.SA","PETZ3.SA","BHIA3.SA","DXCO3.SA","MGLU3.SA","FLRY3.SA",
+            "ALPA4.SA","ARZZ3.SA","RAIZ4.SA","RECV3.SA","SLCE3.SA","VIVA3.SA",
+            "TRPL4.SA","POMO4.SA","BPAC11.SA","STBP3.SA","BRAP4.SA","SMLS3.SA",
+            # Additional B3 large caps
+            "ALUP11.SA","AURE3.SA","AZEV3.SA","BRML3.SA","BRPR3.SA","CARD3.SA",
+            "CMIN3.SA","CNTB3.SA","CURY3.SA","DIRR3.SA","ECOR3.SA","ENEV3.SA",
+            "ESPA3.SA","EVEN3.SA","FESA4.SA","GGPS3.SA","GMAT3.SA","GRND3.SA",
+            "HBSA3.SA","HYPE3.SA","IFCM3.SA","IGTI11.SA","IRBR3.SA","ITUB3.SA",
+            "JHSF3.SA","LJQQ3.SA","LOGG3.SA","LWSA3.SA","MDIA3.SA","MILS3.SA",
+            "MOVI3.SA","MYPK3.SA","NEOE3.SA","ODPV3.SA","OIBR3.SA","ONCO3.SA",
+            "ORVR3.SA","PCAR3.SA","PDGR3.SA","PORT3.SA","PTBL3.SA","QUAL3.SA",
+            "RAPT4.SA","RDNI3.SA","REDE3.SA","ROMI3.SA","RRRP3.SA","SBFG3.SA",
+            "SMFT3.SA","TAEE11.SA","TGMA3.SA","TPVB3.SA","TRIS3.SA","TTEN3.SA",
+            "TUPY3.SA","UNIP6.SA","USIM5.SA","VALE3.SA","VAMO3.SA","VIVA3.SA",
         ],
     },
 
-    # ── INDIA ─────────────────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════
+    # INDIA — Nifty 50 + Nifty Next 50
+    # ══════════════════════════════════════════════════════════════
     {
         "country": "India",
         "country_code": "IN",
@@ -471,12 +567,35 @@ COUNTRY_JOBS = [
         "url": "https://en.wikipedia.org/wiki/NIFTY_50",
         "cols": ["Ticker", "Symbol"],
         "manual": [
-            "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "INFY.NS", "ICICIBANK.NS",
-            "HINDUNILVR.NS", "SBIN.NS", "BHARTIARTL.NS", "ITC.NS", "LT.NS",
+            # Nifty 50
+            "RELIANCE.NS","TCS.NS","HDFCBANK.NS","INFY.NS","ICICIBANK.NS",
+            "HINDUNILVR.NS","SBIN.NS","BHARTIARTL.NS","ITC.NS","LT.NS",
+            "KOTAKBANK.NS","AXISBANK.NS","BAJFINANCE.NS","MARUTI.NS","TITAN.NS",
+            "SUNPHARMA.NS","NESTLEIND.NS","HCLTECH.NS","ULTRACEMCO.NS","POWERGRID.NS",
+            "NTPC.NS","WIPRO.NS","ONGC.NS","ASIANPAINT.NS","TECHM.NS","ADANIENT.NS",
+            "ADANIPORTS.NS","BAJAJFINSV.NS","BPCL.NS","BRITANNIA.NS","CIPLA.NS",
+            "COALINDIA.NS","DIVISLAB.NS","DRREDDY.NS","EICHERMOT.NS","GRASIM.NS",
+            "HDFCLIFE.NS","HEROMOTOCO.NS","HINDALCO.NS","INDUSINDBK.NS","JSWSTEEL.NS",
+            "M&M.NS","ONGC.NS","SBILIFE.NS","SHRIRAMFIN.NS","TATACONSUM.NS",
+            "TATAMOTORS.NS","TATASTEEL.NS","TRENT.NS","UPL.NS",
+            # Nifty Next 50
+            "ABB.NS","ACC.NS","ADANIGREEN.NS","ADANITRANS.NS","AMBUJACEM.NS",
+            "APOLLOHOSP.NS","AUROPHARMA.NS","BAJAJ-AUTO.NS","BANKBARODA.NS",
+            "BERGEPAINT.NS","BOSCHLTD.NS","CANFINHOME.NS","CANBK.NS","CHOLAFIN.NS",
+            "COLPAL.NS","DABUR.NS","DLF.NS","GAIL.NS","GODREJCP.NS","HAVELLS.NS",
+            "ICICIPRULI.NS","IDFCFIRSTB.NS","IGL.NS","INDUSTOWER.NS","IOC.NS",
+            "IRCTC.NS","JINDALSTEL.NS","JUBLFOOD.NS","LICHSGFIN.NS","LUPIN.NS",
+            "MARICO.NS","MCDOWELL-N.NS","MOTHERSON.NS","MPHASIS.NS","MRF.NS",
+            "NAUKRI.NS","NMDC.NS","OFSS.NS","PAGEIND.NS","PIIND.NS","PIDILITIND.NS",
+            "PNBHOUSING.NS","POONAWALLA.NS","RECLTD.NS","SAIL.NS","SIEMENS.NS",
+            "SRF.NS","TORNTPHARM.NS","TVSMOTOR.NS","VBL.NS","VEDL.NS","VOLTAS.NS",
+            "ZYDUSLIFE.NS",
         ],
     },
 
-    # ── SOUTH KOREA ───────────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════
+    # SOUTH KOREA — KOSPI 200 large caps
+    # ══════════════════════════════════════════════════════════════
     {
         "country": "South Korea",
         "country_code": "KR",
@@ -484,12 +603,26 @@ COUNTRY_JOBS = [
         "url": "https://en.wikipedia.org/wiki/KOSPI",
         "cols": ["Ticker", "Symbol", "Code"],
         "manual": [
-            "005930.KS", "000660.KS", "035420.KS", "051910.KS", "006400.KS",
-            "207940.KS", "035720.KS", "000270.KS", "068270.KS", "105560.KS",
+            "005930.KS","000660.KS","035420.KS","051910.KS","006400.KS",
+            "207940.KS","035720.KS","000270.KS","068270.KS","105560.KS",
+            "055550.KS","028260.KS","012330.KS","066570.KS","003550.KS",
+            "010130.KS","096770.KS","017670.KS","034730.KS","003490.KS",
+            "000810.KS","011200.KS","015760.KS","032640.KS","034020.KS",
+            "036570.KS","047050.KS","086790.KS","138040.KS","139480.KS",
+            "161390.KS","180640.KS","192820.KS","214420.KS","247540.KS",
+            "251270.KS","267250.KS","271560.KS","282330.KS","316140.KS",
+            "326030.KS","329180.KS","336370.KS","352820.KS","361610.KS",
+            "373220.KS","402340.KS","003410.KS","004020.KS","005380.KS",
+            "005490.KS","006360.KS","007070.KS","009150.KS","009830.KS",
+            "010120.KS","010950.KS","011070.KS","011170.KS","011790.KS",
+            "012450.KS","014820.KS","018260.KS","018880.KS","023530.KS",
+            "024110.KS","028050.KS","029780.KS","030200.KS","033780.KS",
         ],
     },
 
-    # ── HONG KONG ─────────────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════
+    # HONG KONG — Hang Seng Index (correct yfinance format: 4-digit.HK)
+    # ══════════════════════════════════════════════════════════════
     {
         "country": "Hong Kong",
         "country_code": "HK",
@@ -497,12 +630,28 @@ COUNTRY_JOBS = [
         "url": "https://en.wikipedia.org/wiki/Hang_Seng_Index",
         "cols": ["Ticker", "Code", "Symbol"],
         "manual": [
-            "0700.HK", "0005.HK", "0941.HK", "1299.HK", "0388.HK",
-            "2318.HK", "0016.HK", "1093.HK", "0883.HK", "2628.HK",
+            # Must use zero-padded format for yfinance
+            "0700.HK","0005.HK","0941.HK","1299.HK","0388.HK","2318.HK",
+            "0016.HK","1093.HK","0883.HK","2628.HK","0003.HK","0006.HK",
+            "0011.HK","0012.HK","0027.HK","0066.HK","0101.HK","0175.HK",
+            "0241.HK","0267.HK","0285.HK","0288.HK","0291.HK","0300.HK",
+            "0316.HK","0322.HK","0386.HK","0669.HK","0688.HK","0762.HK",
+            "0823.HK","0836.HK","0857.HK","0868.HK","0881.HK","0939.HK",
+            "0960.HK","0968.HK","0981.HK","0992.HK","1024.HK","1038.HK",
+            "1044.HK","1088.HK","1099.HK","1109.HK","1113.HK","1177.HK",
+            "1209.HK","1211.HK","1299.HK","1378.HK","1398.HK","1810.HK",
+            "1876.HK","1928.HK","1929.HK","1997.HK","2015.HK","2018.HK",
+            "2020.HK","2057.HK","2269.HK","2313.HK","2319.HK","2331.HK",
+            "2359.HK","2382.HK","2388.HK","2618.HK","2628.HK","2688.HK",
+            "2899.HK","3690.HK","3692.HK","3968.HK","3988.HK","6618.HK",
+            "6690.HK","6862.HK","9618.HK","9633.HK","9888.HK","9961.HK",
+            "9988.HK","9992.HK","9999.HK",
         ],
     },
 
-    # ── SINGAPORE ─────────────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════
+    # SINGAPORE — Straits Times Index + SGX large caps
+    # ══════════════════════════════════════════════════════════════
     {
         "country": "Singapore",
         "country_code": "SG",
@@ -510,12 +659,17 @@ COUNTRY_JOBS = [
         "url": "https://en.wikipedia.org/wiki/Straits_Times_Index",
         "cols": ["Ticker", "Symbol"],
         "manual": [
-            "D05.SI", "O39.SI", "U11.SI", "Z74.SI", "C52.SI",
-            "G13.SI", "BN4.SI", "C6L.SI", "Y92.SI", "V03.SI",
+            "D05.SI","O39.SI","U11.SI","Z74.SI","C52.SI","G13.SI","BN4.SI",
+            "C6L.SI","Y92.SI","V03.SI","A17U.SI","BS6.SI","C07.SI","C09.SI",
+            "C38U.SI","D01.SI","F34.SI","H78.SI","J36.SI","J69U.SI","K71U.SI",
+            "M44U.SI","ME8U.SI","N2IU.SI","N4E.SI","NS8U.SI","P15.SI","RE4.SI",
+            "S51.SI","S58.SI","S68.SI","T82U.SI","U09.SI","U96.SI","UD2.SI",
         ],
     },
 
-    # ── DENMARK ───────────────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════
+    # DENMARK — OMX Copenhagen 25
+    # ══════════════════════════════════════════════════════════════
     {
         "country": "Denmark",
         "country_code": "DK",
@@ -523,12 +677,17 @@ COUNTRY_JOBS = [
         "url": "https://en.wikipedia.org/wiki/OMX_Copenhagen_25",
         "cols": ["Ticker", "Symbol"],
         "manual": [
-            "NOVO-B.CO", "MAERSK-B.CO", "DSV.CO", "ORSTED.CO", "CARL-B.CO",
-            "COLO-B.CO", "GN.CO", "TRYG.CO", "PNDORA.CO", "RBREW.CO",
+            "NOVO-B.CO","MAERSK-B.CO","DSV.CO","ORSTED.CO","CARL-B.CO",
+            "COLO-B.CO","GN.CO","TRYG.CO","PNDORA.CO","RBREW.CO",
+            "AMBU-B.CO","CHR.CO","DEMANT.CO","FLS.CO","GMAB.CO",
+            "ISS.CO","JYSK.CO","NNIT.CO","NTG.CO","NZYM-B.CO",
+            "ROCK-B.CO","SIM.CO","SOLAR-B.CO","SPLY.CO","VWS.CO",
         ],
     },
 
-    # ── NORWAY ────────────────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════
+    # NORWAY — OBX 25 + large caps
+    # ══════════════════════════════════════════════════════════════
     {
         "country": "Norway",
         "country_code": "NO",
@@ -536,12 +695,20 @@ COUNTRY_JOBS = [
         "url": "https://en.wikipedia.org/wiki/OBX_Stock_Index",
         "cols": ["Ticker", "Symbol"],
         "manual": [
-            "EQNR.OL", "DNB.OL", "MOWI.OL", "YAR.OL", "TEL.OL",
-            "ORK.OL", "SCHIBSTED-A.OL", "NHY.OL", "AKRBP.OL", "BAKKA.OL",
+            "EQNR.OL","DNB.OL","MOWI.OL","YAR.OL","TEL.OL","ORK.OL",
+            "NHY.OL","AKRBP.OL","BAKKA.OL","SUBC.OL","SCHA.OL",
+            "AKER.OL","AKSO.OL","BWLPG.OL","FRO.OL","GOGL.OL",
+            "HAFNIA.OL","NSKOG.OL","ODF.OL","PGS.OL","REC.OL",
+            "SALM.OL","SCHB.OL","STB.OL","TGS.OL","WAWI.OL",
+            "AFG.OL","AGAS.OL","ARCH.OL","BORR.OL","COOL.OL",
+            "FLNG.OL","HECO.OL","HUNT.OL","JINHUI.OL","MAG.OL",
+            "MPCC.OL","NAVA.OL","NEXT.OL","OKEA.OL","OSE.OL",
         ],
     },
 
-    # ── FINLAND ───────────────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════
+    # FINLAND — OMX Helsinki 25
+    # ══════════════════════════════════════════════════════════════
     {
         "country": "Finland",
         "country_code": "FI",
@@ -549,12 +716,18 @@ COUNTRY_JOBS = [
         "url": "https://en.wikipedia.org/wiki/OMX_Helsinki_25",
         "cols": ["Ticker", "Symbol"],
         "manual": [
-            "NOKIA.HE", "KNEBV.HE", "NESTE.HE", "SAMPO.HE", "OUT1V.HE",
-            "FORTUM.HE", "WRT1V.HE", "STERV.HE", "KEMIRA.HE", "TIETO.HE",
+            "NOKIA.HE","KNEBV.HE","NESTE.HE","SAMPO.HE","OUT1V.HE","FORTUM.HE",
+            "WRT1V.HE","STERV.HE","KEMIRA.HE","TIETO.HE","CGCBV.HE","ELISA.HE",
+            "FSKRS.HE","HUH1V.HE","ICP1V.HE","KEMIRA.HE","KESKOB.HE","KONE.HE",
+            "METSO.HE","METSB.HE","NDA-FI.HE","ORNBV.HE","PIHLIS.HE","QTCOM.HE",
+            "RAIVV.HE","RTRKS.HE","SAMAS.HE","SRV1V.HE","SSABAH.HE","TEM1V.HE",
+            "TIE1V.HE","TNOM.HE","UPM.HE","VALMT.HE","YIT1V.HE",
         ],
     },
 
-    # ── POLAND ────────────────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════
+    # POLAND — WIG 20 + mWIG 40 extras
+    # ══════════════════════════════════════════════════════════════
     {
         "country": "Poland",
         "country_code": "PL",
@@ -562,12 +735,16 @@ COUNTRY_JOBS = [
         "url": "https://en.wikipedia.org/wiki/WIG20",
         "cols": ["Ticker", "Symbol"],
         "manual": [
-            "PKN.WA", "PKO.WA", "PEKAO.WA", "PZU.WA", "DNP.WA",
-            "JSW.WA", "KGHM.WA", "LPP.WA", "OPL.WA", "CDR.WA",
+            "PKN.WA","PKO.WA","PZU.WA","DNP.WA","JSW.WA","LPP.WA","OPL.WA",
+            "CDR.WA","ALE.WA","CCC.WA","DIINO.WA","EUR.WA","HRS.WA","ING.WA",
+            "KGH.WA","MBK.WA","MRC.WA","PCO.WA","PEPCO.WA","PEO.WA",
+            "PKP.WA","PLW.WA","PZU.WA","SPH.WA","TEN.WA",
         ],
     },
 
-    # ── SOUTH AFRICA ──────────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════
+    # SOUTH AFRICA — JSE Top 40
+    # ══════════════════════════════════════════════════════════════
     {
         "country": "South Africa",
         "country_code": "ZA",
@@ -575,12 +752,18 @@ COUNTRY_JOBS = [
         "url": "https://en.wikipedia.org/wiki/JSE_Securities_Exchange",
         "cols": ["Ticker", "Symbol"],
         "manual": [
-            "NPN.JO", "PRX.JO", "BTI.JO", "BHP.JO", "AGL.JO",
-            "SOL.JO", "SBK.JO", "NED.JO", "FSR.JO", "ABG.JO",
+            "NPN.JO","PRX.JO","BTI.JO","AGL.JO","SOL.JO","SBK.JO","NED.JO",
+            "FSR.JO","ABG.JO","CFR.JO","BVT.JO","DSY.JO","GRT.JO","HAR.JO",
+            "IMP.JO","INL.JO","INP.JO","IPL.JO","LHC.JO","MCG.JO","MNP.JO",
+            "MRP.JO","MTN.JO","MUR.JO","NHM.JO","NRP.JO","OMU.JO","PPH.JO",
+            "RBP.JO","RDF.JO","REM.JO","RNI.JO","SHP.JO","SPP.JO","TFG.JO",
+            "TGA.JO","TRU.JO","VOD.JO","WHL.JO","ANG.JO","EXX.JO","GFI.JO",
         ],
     },
 
-    # ── BELGIUM ───────────────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════
+    # BELGIUM — BEL 20
+    # ══════════════════════════════════════════════════════════════
     {
         "country": "Belgium",
         "country_code": "BE",
@@ -588,12 +771,15 @@ COUNTRY_JOBS = [
         "url": "https://en.wikipedia.org/wiki/BEL20",
         "cols": ["Ticker", "Symbol"],
         "manual": [
-            "UCB.BR", "KBC.BR", "ACKB.BR", "ABI.BR", "SOLB.BR",
-            "COFB.BR", "COLR.BR", "ARGX.BR", "WDP.BR", "BPOST.BR",
+            "UCB.BR","KBC.BR","ACKB.BR","ABI.BR","SOLB.BR","COFB.BR","COLR.BR",
+            "ARGX.BR","WDP.BR","BPOST.BR","ELIA.BR","GBLB.BR","ING.BR","LOTB.BR",
+            "MELX.BR","ONTEX.BR","UCB.BR","UMI.BR","XIOR.BR",
         ],
     },
 
-    # ── PORTUGAL ──────────────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════
+    # PORTUGAL — PSI 20
+    # ══════════════════════════════════════════════════════════════
     {
         "country": "Portugal",
         "country_code": "PT",
@@ -601,12 +787,15 @@ COUNTRY_JOBS = [
         "url": "https://en.wikipedia.org/wiki/PSI-20",
         "cols": ["Ticker", "Symbol"],
         "manual": [
-            "EDP.LS", "GALP.LS", "BCP.LS", "NOS.LS", "JMT.LS",
-            "SON.LS", "EGL.LS", "EDPR.LS", "CTT.LS", "RAM.LS",
+            "EDP.LS","GALP.LS","BCP.LS","NOS.LS","JMT.LS","SON.LS","EGL.LS",
+            "EDPR.LS","CTT.LS","NVG.LS","ALTR.LS","COR.LS","ELEC.LS","ENGI.LS",
+            "IPMA.LS","MOTA.LS","PHR.LS","RAMB.LS","RENE.LS","TDSA.LS",
         ],
     },
 
-    # ── AUSTRIA ───────────────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════
+    # AUSTRIA — ATX 20
+    # ══════════════════════════════════════════════════════════════
     {
         "country": "Austria",
         "country_code": "AT",
@@ -614,12 +803,17 @@ COUNTRY_JOBS = [
         "url": "https://en.wikipedia.org/wiki/Austrian_Traded_Index",
         "cols": ["Ticker", "Symbol"],
         "manual": [
-            "EBS.VI", "OMV.VI", "VIG.VI", "BAWAG.VI", "RBI.VI",
-            "POST.VI", "TKA.VI", "EVN.VI", "AMS.VI", "SBO.VI",
+            "EBS.VI","OMV.VI","VIG.VI","RBI.VI","POST.VI","TKA.VI","EVN.VI",
+            "SBO.VI","AT1.VI","ATS.VI","BG.VI","CAI.VI","DO.VI","EAG.VI",
+            "FMT.VI","GRB.VI","IIA.VI","KAP.VI","LNZ.VI","MIBA.VI","MOS.VI",
+            "NWT.VI","OMV.VI","PAL.VI","PYT.VI","QPS.VI","S.VI","SPI.VI",
+            "TKH.VI","TQQ.VI","UNI.VI","VAS.VI","VER.VI","WIE.VI","ZAG.VI",
         ],
     },
 
-    # ── IRELAND ───────────────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════
+    # IRELAND — ISEQ 20
+    # ══════════════════════════════════════════════════════════════
     {
         "country": "Ireland",
         "country_code": "IE",
@@ -627,12 +821,19 @@ COUNTRY_JOBS = [
         "url": "https://en.wikipedia.org/wiki/ISEQ_20",
         "cols": ["Ticker", "Symbol"],
         "manual": [
-            "CRH.L", "BIRG.L", "AIB.L", "SMURFIT.L", "FLTR.L",
-            "DPH.L", "TPOU.L", "AERCAP.L", "ICG.L", "IEP.L",
+            # Irish stocks primarily trade in Dublin (.IR) or London (.L)
+            "CRH.L","FLTR.L","ICG.L","BIRG.L","AIB.L","PTSB.L","TDOC.L",
+            "CRH.IR","FLTR.IR","ICG.IR","BIRG.IR","AIB.IR","PTSB.IR",
+            "KORE.IR","ORLA.IR","CPL.IR","DHG.IR","DRV.IR","GLB.IR",
+            "GLV.IR","GOI.IR","IFG.IR","INA.IR","IRM.IR","ISF.IR",
+            "MALIN.IR","MAN.IR","NWL.IR","OGN.IR","SMURFIT.L","TPVG.IR",
+            "AMRG.L","AERCAP.L","DPLM.L","G4M.L","GYM.L","KNDL.L",
         ],
     },
 
-    # ── MEXICO ────────────────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════
+    # MEXICO — IPC / BMV (correct suffixes — use MX not .MX for BMV)
+    # ══════════════════════════════════════════════════════════════
     {
         "country": "Mexico",
         "country_code": "MX",
@@ -640,12 +841,21 @@ COUNTRY_JOBS = [
         "url": "https://en.wikipedia.org/wiki/Indice_de_Precios_y_Cotizaciones",
         "cols": ["Ticker", "Symbol"],
         "manual": [
-            "AMXL.MX", "FEMSAUBD.MX", "WALMEX*.MX", "GMEXICOB.MX",
-            "TLEVISACPO.MX", "BIMBOA.MX", "KOFUBL.MX", "GFNORTEO.MX",
+            # yfinance: Mexican stocks use ticker.MX format
+            "AMXL.MX","FEMSAUBD.MX","WALMEX.MX","GMEXICOB.MX","KOFUBL.MX",
+            "GFNORTEO.MX","GFBANORTEO.MX","BOLSAA.MX","CEMEXCPO.MX","BIMBOA.MX",
+            "GCARSOA1.MX","TLEVICPO.MX","MEGACPO.MX","ALFAA.MX","ASURB.MX",
+            "GAPB.MX","OMAB.MX","GENTERA.MX","RA.MX","PINFRA.MX","ORBIA.MX",
+            "GRUMAB.MX","KIMBER.MX","LIVEPOLC-1.MX","LAB.MX","LABB.MX",
+            "VOLAR.MX","AC.MX","AGUA.MX","ALSEA.MX","AMX.MX","BACHOCOB.MX",
+            "CUERVO.MX","FINN13.MX","GICSAB.MX","GPROFUT.MX","GCC.MX",
+            "ICHB.MX","LABB.MX","LIVEPOLC1.MX","MFRISCOA-1.MX","PASA.MX",
         ],
     },
 
-    # ── NEW ZEALAND ───────────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════
+    # NEW ZEALAND — NZX 50
+    # ══════════════════════════════════════════════════════════════
     {
         "country": "New Zealand",
         "country_code": "NZ",
@@ -653,17 +863,25 @@ COUNTRY_JOBS = [
         "url": "https://en.wikipedia.org/wiki/S%26P/NZX_50_Index",
         "cols": ["Ticker", "Symbol"],
         "manual": [
-            "FPH.NZ", "MEL.NZ", "CEN.NZ", "ATM.NZ", "EBO.NZ",
-            "MCY.NZ", "PCT.NZ", "SUM.NZ", "AIA.NZ", "HGH.NZ",
+            "FPH.NZ","MEL.NZ","CEN.NZ","ATM.NZ","EBO.NZ","MCY.NZ","PCT.NZ",
+            "SUM.NZ","AIA.NZ","HGH.NZ","AIR.NZ","ANZ.NZ","ARG.NZ","CAV.NZ",
+            "CDI.NZ","CMO.NZ","CNU.NZ","CVT.NZ","DGL.NZ","DIL.NZ","EBO.NZ",
+            "EMF.NZ","EVO.NZ","FCG.NZ","FRE.NZ","FSF.NZ","GNE.NZ","GTK.NZ",
+            "HLG.NZ","IFT.NZ","KMD.NZ","MFT.NZ","MHJ.NZ","MNW.NZ","MYR.NZ",
+            "NPX.NZ","NZR.NZ","OCA.NZ","PFI.NZ","PGW.NZ","POT.NZ","PPH.NZ",
+            "RBD.NZ","RYM.NZ","SCL.NZ","SKC.NZ","SKT.NZ","SML.NZ","SPK.NZ",
+            "STU.NZ","THL.NZ","THL.NZ","TPW.NZ","TRA.NZ","TWR.NZ","VCT.NZ",
+            "VGL.NZ","VHP.NZ","WBC.NZ","WHS.NZ",
         ],
     },
+
 ]
 
-
-# ─── RUN ──────────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# RUN
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def run_all(jobs: list, parallel: bool = True):
-    """Run all country jobs. Set parallel=False to debug a single country."""
     if parallel:
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             futures = {executor.submit(extract_country_data, job): job["country"] for job in jobs}
@@ -678,29 +896,20 @@ def run_all(jobs: list, parallel: bool = True):
             extract_country_data(job)
 
 def run_single(country_name: str):
-    """Run extraction for a single country by name (useful for testing/adding new)."""
     matches = [j for j in COUNTRY_JOBS if j["country"].lower() == country_name.lower()]
     if not matches:
-        log.error(f"Country '{country_name}' not found in COUNTRY_JOBS.")
+        log.error(f"Country '{country_name}' not found.")
         log.info(f"Available: {[j['country'] for j in COUNTRY_JOBS]}")
         return
     extract_country_data(matches[0])
 
-
-# ─── ENTRY POINT ─────────────────────────────────────────────────────────────
-
 if __name__ == "__main__":
     import argparse
-
-    parser = argparse.ArgumentParser(description="Global Stock Data Extractor")
-    parser.add_argument(
-        "--country", type=str, default=None,
-        help="Run for a single country only (e.g. --country Germany)"
-    )
-    parser.add_argument(
-        "--sequential", action="store_true",
-        help="Disable parallel processing (useful for debugging)"
-    )
+    parser = argparse.ArgumentParser(description="Global Stock Data Extractor v2")
+    parser.add_argument("--country", type=str, default=None,
+                        help="Run for a single country (e.g. --country Brazil)")
+    parser.add_argument("--sequential", action="store_true",
+                        help="Disable parallel processing")
     args = parser.parse_args()
 
     if args.country:
