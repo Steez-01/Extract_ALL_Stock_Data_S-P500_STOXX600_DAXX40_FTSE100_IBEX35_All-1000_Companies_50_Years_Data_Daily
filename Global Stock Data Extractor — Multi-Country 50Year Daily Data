@@ -10,6 +10,13 @@ Countries covered (28):
   Italy, Japan, Australia, Canada, Brazil, India, South Korea, Hong Kong,
   Singapore, Denmark, Norway, Finland, Poland, South Africa, Belgium,
   Portugal, Austria, Ireland, Mexico, New Zealand
+
+Run modes:
+  python script.py                         # all 28 countries, sequential
+  python script.py --group europe          # Europe only
+  python script.py --group americas        # Americas only
+  python script.py --group asia            # Asia-Pacific + Africa
+  python script.py --country Brazil        # single country
 """
 
 import pandas as pd
@@ -22,18 +29,20 @@ import os
 import time
 import logging
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 
-START_DATE     = "1976-01-01"
-END_DATE       = datetime.today().strftime("%Y-%m-%d")
-OUTPUT_DIR     = "output"
-CACHE_FILE     = "ticker_cache.json"
-MAX_WORKERS    = 4
-DOWNLOAD_CHUNK = 50
-RETRY_ATTEMPTS = 3
-RETRY_DELAY    = 5
+START_DATE          = "1976-01-01"
+END_DATE            = datetime.today().strftime("%Y-%m-%d")
+OUTPUT_DIR          = "output"
+CACHE_FILE          = "ticker_cache.json"
+DEAD_FILE           = "dead_tickers.json"
+MAX_WORKERS         = 1      # Keep at 1 — parallel yf.download() calls mix
+                             # up each other's results (thread-safety bug).
+DOWNLOAD_CHUNK      = 50
+RETRY_ATTEMPTS      = 3
+RETRY_DELAY         = 5
+INTER_COUNTRY_DELAY = 8      # seconds to pause between countries (rate-limit guard)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s")
 log = logging.getLogger(__name__)
@@ -81,6 +90,48 @@ def update_cache(index_name: str, tickers: list):
 def get_cached_tickers(index_name: str) -> list:
     return load_cache().get(index_name, [])
 
+# ─── DEAD TICKER REGISTRY ─────────────────────────────────────────────────────
+
+def load_dead_set() -> set:
+    """Return the set of confirmed-delisted tickers (skipped on future runs)."""
+    if os.path.exists(DEAD_FILE):
+        with open(DEAD_FILE, "r") as f:
+            return set(json.load(f))
+    return set()
+
+def add_dead_tickers(tickers: list):
+    """Persist confirmed-delisted tickers so they are skipped on future runs."""
+    if not tickers:
+        return
+    dead = load_dead_set()
+    before = len(dead)
+    dead.update(tickers)
+    if len(dead) > before:
+        with open(DEAD_FILE, "w") as f:
+            json.dump(sorted(dead), f, indent=2)
+        log.info(f"   Dead-ticker list updated: {len(dead)} total ({len(dead)-before} new)")
+
+def clean_double_suffix_from_cache():
+    # Remove tickers with duplicated exchange suffix created by the Wikipedia
+    # scraper bug.  Two patterns are cleaned:
+    #   dash-double:  RI-PA.PA   ABBN-SW.SW   (dash then dot suffix)
+    #   dot-double:   AIR.PA.DE  ASML.AS.AS   (two dot-suffixes concatenated)
+    import re
+    pat_dash = re.compile(r'^.+-[A-Z]{2,3}\.[A-Z]{2,3}$')
+    pat_dot  = re.compile(r'^.*\.[A-Z]{2,3}\.[A-Z]{2,3}$')
+    cache = load_cache()
+    changed = False
+    for key in list(cache.keys()):
+        clean = [t for t in cache[key]
+                 if not pat_dash.match(t) and not pat_dot.match(t)]
+        removed = len(cache[key]) - len(clean)
+        if removed:
+            log.info(f"   Cache cleanup [{key}]: removed {removed} malformed tickers")
+            cache[key] = clean
+            changed = True
+    if changed:
+        save_cache(cache)
+
 # ─── WIKIPEDIA SCRAPING ───────────────────────────────────────────────────────
 
 TICKER_COLUMN_CANDIDATES = [
@@ -105,6 +156,12 @@ def scrape_wikipedia_tickers(url: str, suffix: str, col_hints: list = None) -> l
                     for t in raw_tickers:
                         t = t.strip().split(" ")[0].replace(" ", "").replace("\xa0", "")
                         if t and not t.startswith("0") and len(t) <= 12:
+                            # Normalize dash-format exchange codes to dot format
+                            # e.g. "ABBN-SW" → "ABBN.SW" when suffix is ".SW"
+                            if suffix:
+                                dash_suffix = "-" + suffix.lstrip(".")
+                                if t.endswith(dash_suffix):
+                                    t = t[:-len(dash_suffix)] + suffix
                             tickers.append(t + suffix if not t.endswith(suffix) else t)
                     if tickers:
                         log.info(f"   Wikipedia: found {len(tickers)} tickers via column '{col}'")
@@ -118,18 +175,29 @@ def scrape_wikipedia_tickers(url: str, suffix: str, col_hints: list = None) -> l
 
 def rank_by_market_cap(tickers: list) -> list:
     log.info(f"   Ranking {len(tickers)} tickers by market cap...")
+    if len(tickers) > 150:
+        log.info(f"   Skipping market-cap sort (>{len(tickers)} tickers) — using list order.")
+        return tickers
     cap_map = {}
+    dead_found = []
     for i in range(0, len(tickers), DOWNLOAD_CHUNK):
         chunk = tickers[i : i + DOWNLOAD_CHUNK]
         for t in chunk:
             try:
                 fi = yf.Ticker(t).fast_info
-                cap = getattr(fi, "market_cap", None) or 0
-                if cap > 0:
+                cap = getattr(fi, "market_cap", None)
+                if cap and isinstance(cap, (int, float)) and cap > 0:
                     cap_map[t] = cap
-            except Exception:
-                pass
+            except Exception as e:
+                # Only permanently blacklist tickers that Yahoo explicitly
+                # confirms are delisted.  "no timezone" is a transient
+                # rate-limit/session error and must NOT be treated as permanent.
+                if "symbol may be delisted" in str(e).lower():
+                    dead_found.append(t)
+            finally:
+                time.sleep(0.05)
         time.sleep(0.5)
+    add_dead_tickers(dead_found)
     ranked = sorted(cap_map, key=cap_map.get, reverse=True)
     unranked = [t for t in tickers if t not in cap_map]
     log.info(f"   Ranked: {len(ranked)} valid | Skipped (no cap data): {len(unranked)}")
@@ -141,13 +209,36 @@ def download_with_retry(tickers: list, start: str, end: str) -> pd.DataFrame:
     for attempt in range(1, RETRY_ATTEMPTS + 1):
         try:
             data = yf.download(tickers, start=start, end=end,
-                               auto_adjust=True, progress=False, threads=True)
-            close = data["Close"] if isinstance(data.columns, pd.MultiIndex) else data
+                               auto_adjust=True, progress=False, threads=False)
+            if data.empty:
+                raise ValueError("yfinance returned an empty DataFrame")
+            if isinstance(data.columns, pd.MultiIndex):
+                # Multi-ticker: top level = price type, second level = ticker
+                if "Close" in data.columns.get_level_values(0):
+                    close = data["Close"]
+                else:
+                    close = data.xs("Close", axis=1, level=1)
+            else:
+                # Single-ticker: flat columns (Open, High, Low, Close, Volume)
+                if "Close" in data.columns:
+                    close = data[["Close"]].rename(columns={"Close": tickers[0]})
+                else:
+                    close = data.iloc[:, :1].rename(columns={data.columns[0]: tickers[0]})
             return close
         except Exception as e:
-            log.warning(f"   Download attempt {attempt} failed: {e}")
-            if attempt < RETRY_ATTEMPTS:
-                time.sleep(RETRY_DELAY * attempt)
+            err_str = str(e)
+            if "Too Many Requests" in err_str or "Rate limited" in err_str or "YFRateLimitError" in err_str:
+                wait = 60 * attempt
+                log.warning(f"   Rate limited — waiting {wait}s before retry {attempt+1}...")
+                time.sleep(wait)
+            elif "401" in err_str or "Unauthorized" in err_str or "Invalid Crumb" in err_str:
+                wait = 15 * attempt
+                log.warning(f"   Yahoo auth error — waiting {wait}s before retry {attempt+1}...")
+                time.sleep(wait)
+            else:
+                log.warning(f"   Download attempt {attempt} failed: {e}")
+                if attempt < RETRY_ATTEMPTS:
+                    time.sleep(RETRY_DELAY * attempt)
     log.error("   All download attempts failed.")
     return pd.DataFrame()
 
@@ -170,6 +261,14 @@ def extract_country_data(job: dict):
     combined = list(set(cached) | set(auto) | set(manual))
     log.info(f"   Combined (cached + auto + manual): {len(combined)} unique tickers")
 
+    # Remove confirmed-delisted tickers before ranking and downloading
+    dead = load_dead_set()
+    combined_clean = [t for t in combined if t not in dead]
+    if len(combined_clean) < len(combined):
+        log.info(f"   Dead-ticker filter removed {len(combined)-len(combined_clean)} tickers; "
+                 f"{len(combined_clean)} remain")
+    combined = combined_clean
+
     combined = update_cache(index_name, combined)
     ranked   = rank_by_market_cap(combined)
 
@@ -180,7 +279,19 @@ def extract_country_data(job: dict):
         log.error(f"   No data returned for {index_name}. Skipping export.")
         return
 
-    available = [t for t in ranked if t in close_df.columns]
+    if close_df.columns.empty:
+        log.error(f"   Close DataFrame has no columns for {index_name}. Skipping export.")
+        return
+
+    # Normalise to string for safe comparison (yfinance may alter suffix casing)
+    col_set   = set(close_df.columns.astype(str))
+    available = [t for t in ranked if str(t) in col_set]
+
+    if not available:
+        log.error(f"   No ranked tickers matched downloaded columns for {index_name}. "
+                  f"Sample columns: {list(close_df.columns[:5])}")
+        return
+
     close_df  = close_df[available]
     df_wide   = close_df.transpose()
     df_wide.columns = pd.to_datetime(df_wide.columns).strftime("%Y-%m-%d")
@@ -217,25 +328,29 @@ COUNTRY_JOBS = [
             "EMR","ROP","SHW","GD","USB","PH","CTAS","GM","WELL","MCO","WM","MSI",
             "PSA","PCAR","FCX","ECL","NKE","F","CARR","D","OKE","FICO","AIG","MCK",
             "MAR","COF","APH","FDX","ORLY","SPG","FTNT","HLT","CCI","PNC","AFL",
-            "NXPI","TDG","CSX","IDXX","TFC","FAST","MNST","HES","KMB","ROST","AZO",
+            "NXPI","TDG","CSX","IDXX","TFC","FAST","MNST","KMB","ROST","AZO",
             "EXC","DHI","VRSK","GWW","DOW","CSGP","CTVA","CMG","A","MSCI","HUM",
             "TEL","EBAY","SRE","PAYX","NUE","OTIS","KDP","CPRT","GEHC","PCG","ALL",
             "KR","YUM","VICI","DLTR","GIS","PRU","AEP","PWR","MPWR","AME","EA",
             "ODFL","DXCM","ACGL","HSY","BIIB","O","ROK","BAX","ED","SYY","DAL",
-            "HIG","STZ","LH","CTSH","WEC","SBUX","TROW","IQV","ANSS","KHC","XEL",
+            "HIG","STZ","LH","CTSH","WEC","SBUX","TROW","IQV","KHC","XEL",
             "CNC","PPG","KEYS","WST","TSCO","DVN","EIX","AWK","MTD","ULTA","MCHP",
             "HOLX","FIS","TTWO","CDNS","VLO","BALL","LMT","MKC","WAT","IT","HPQ",
             "FITB","MTB","ES","PPL","DTE","RMD","EFX","CHD","ZBRA","RF","DOV","LUV",
-            "IFF","HRL","TRMB","EG","BR","STT","OMC","CAH","INVH","WBA","PFG",
+            "IFF","HRL","TRMB","EG","BR","STT","OMC","CAH","INVH","PFG",
             "STE","IP","CLX","FTV","ARE","IEX","CINF","EXPD","LVS","FSLR","HWM",
             "PKG","POOL","CTRA","TER","HAL","SWKS","CF","LYB","GLW","NTAP","AKAM",
-            "TPR","JKHY","EMN","ENPH","CHRW","WRB","DPZ","BF-B","K","AVY","MOS",
-            "CPT","AIZ","ALLE","AOS","BWA","CPB","MHK","HSIC","JNPR","NWSA","NWS",
+            "TPR","JKHY","EMN","ENPH","CHRW","WRB","DPZ","AVY","MOS",
+            "CPT","AIZ","ALLE","AOS","BWA","CPB","MHK","HSIC","NWSA","NWS",
             "LNC","PNR","RL","DVA","FMC","HII","IRM","L","AAL","NCLH","CCL","RCL",
-            "MGM","WYNN","LW","TAP","GPS","PVH","HAS","HA","UHS","CRL","WRK","VTRS",
-            "CAG","SJM","TFSL","CF","DISH","PENN","NRG","AES","DXC","FOX","FOXA",
-            "UA","UAA","AAP","BBWI","BEN","CTLT","CE","MNK","PRGO","RHI","SEE",
-            "XRX","ZION","VFC","WU","DISCA","DISCB","DISCK","NLSN","RE","APA",
+            "MGM","WYNN","LW","TAP","GPS","PVH","HAS","UHS","CRL","VTRS",
+            "CAG","SJM","PENN","NRG","AES","DXC","FOX","FOXA",
+            "UA","UAA","AAP","BBWI","BEN","PRGO","RHI","SEE",
+            "XRX","ZION","VFC","WU","RE","APA",
+            # Removed confirmed-delisted/acquired (2022-2025):
+            # ANSS (→Synopsys), BF-B, CTLT (→Nova), DISH (→DirecTV), DISCA/B/K (→WBD),
+            # HA (→Alaska Air), HES (→Chevron), JNPR (→HPE), K (→Mars),
+            # MNK, NLSN (→private), WBA (→private), WRK (→Smurfit)
         ],
     },
 
@@ -249,14 +364,18 @@ COUNTRY_JOBS = [
         "url": "https://en.wikipedia.org/wiki/DAX",
         "cols": ["Ticker", "Symbol"],
         "manual": [
+            # Core DAX 40 — verified yfinance .DE symbols (April 2026)
             "SAP.DE","SIE.DE","ALV.DE","AIR.DE","MRK.DE","DTE.DE","BMW.DE","MBG.DE",
             "BAS.DE","BAYN.DE","ADS.DE","IFX.DE","ENR.DE","RWE.DE","VNA.DE","HEN3.DE",
             "MTX.DE","EOAN.DE","HEI.DE","DBK.DE","FRE.DE","DPW.DE","HNR1.DE","LHA.DE",
-            "CON.DE","MAN.DE","VOW3.DE","PAH3.DE","P911.DE","ZAL.DE","QIA.DE","SHL.DE",
-            "DHER.DE","SY1.DE","AFX.DE","SDAX.DE","MDAX.DE","1COV.DE","BEI.DE","DB1.DE",
-            "WDI.DE","FME.DE","RNL.DE","COP.DE","PUM.DE","HAB.DE","TKA.DE","RAA.DE",
-            "EVK.DE","KGX.DE","OSB.DE","KWS.DE","HLAG.DE","NDX1.DE","NDA.DE","PSM.DE",
-            "SRT.DE","TAG.DE","EVD.DE","BOSS.DE","AIXA.DE","ARND.DE","BC8.DE","CAP.DE",
+            "CON.DE","VOW3.DE","PAH3.DE","P911.DE","ZAL.DE","QIA.DE","BEI.DE","DB1.DE",
+            "SY1.DE","AFX.DE","1COV.DE","BOSS.DE","AIXA.DE","BC8.DE","TKA.DE","EVK.DE",
+            "KGX.DE","HLAG.DE","SHL.DE","PUM.DE",
+            # Current DAX constituents added / replaced in recent reshuffles
+            "MUV2.DE","RHM.DE","CBK.DE","DTG.DE","G1A.DE","BNR.DE","SHL.DE",
+            # MDAX & SDAX large caps with good yfinance coverage
+            "DHER.DE","KWS.DE","EVD.DE","AIXA.DE","LOGN.DE","LEI.DE","NDA.DE",
+            "CARL.DE","SRT3.DE","TKA.DE","NDX1.DE",
         ],
     },
 
@@ -317,11 +436,16 @@ COUNTRY_JOBS = [
         "url": "https://en.wikipedia.org/wiki/IBEX_35",
         "cols": ["Ticker", "Symbol"],
         "manual": [
+            # IBEX 35 core — verified yfinance .MC symbols
             "ITX.MC","SAN.MC","BBVA.MC","IBE.MC","REP.MC","CABK.MC","TEF.MC",
             "ACS.MC","AENA.MC","CLNX.MC","FER.MC","GRF.MC","IAG.MC","MAP.MC",
-            "MEL.MC","MTS.MC","NTGY.MC","RED.MC","SAB.MC","SGRE.MC","SLR.MC",
-            "SOLARIA.MC","UNI.MC","VIS.MC","ACX.MC","AMS.MC","ANA.MC","BKT.MC",
-            "CAF.MC","COL.MC","ENG.MC","FCC.MC","FLUIDRA.MC","LOG.MC","PHM.MC",
+            "MEL.MC","MTS.MC","NTGY.MC","RED.MC","SAB.MC","SLR.MC",
+            "UNI.MC","VIS.MC","ACX.MC","AMS.MC","ANA.MC","BKT.MC",
+            "CAF.MC","COL.MC","ENG.MC","FCC.MC","LOG.MC","PHM.MC",
+            # SGRE.MC removed — Siemens Gamesa taken private 2023
+            # Additional MSCI Spain large caps
+            "MERLIN.MC","ENCE.MC","NEINOR.MC","A3M.MC","ROVI.MC",
+            "ORYZON.MC","SOLARIA.MC","FLUIDRA.MC","CIE.MC","PUIG.MC",
         ],
     },
 
@@ -695,14 +819,16 @@ COUNTRY_JOBS = [
         "url": "https://en.wikipedia.org/wiki/OBX_Stock_Index",
         "cols": ["Ticker", "Symbol"],
         "manual": [
+            # Verified Oslo Bors (OBX / large-cap) tickers on yfinance .OL
             "EQNR.OL","DNB.OL","MOWI.OL","YAR.OL","TEL.OL","ORK.OL",
             "NHY.OL","AKRBP.OL","BAKKA.OL","SUBC.OL","SCHA.OL",
-            "AKER.OL","AKSO.OL","BWLPG.OL","FRO.OL","GOGL.OL",
-            "HAFNIA.OL","NSKOG.OL","ODF.OL","PGS.OL","REC.OL",
-            "SALM.OL","SCHB.OL","STB.OL","TGS.OL","WAWI.OL",
-            "AFG.OL","AGAS.OL","ARCH.OL","BORR.OL","COOL.OL",
-            "FLNG.OL","HECO.OL","HUNT.OL","JINHUI.OL","MAG.OL",
-            "MPCC.OL","NAVA.OL","NEXT.OL","OKEA.OL","OSE.OL",
+            "AKER.OL","AKSO.OL","FRO.OL","GOGL.OL","HAFNIA.OL",
+            "SALM.OL","STB.OL","TGS.OL","MPCC.OL","BORR.OL",
+            "FLNG.OL","COOL.OL","PGS.OL","NEL.OL","SDRL.OL",
+            "RECSI.OL","GJF.OL","SRBANK.OL","ATEA.OL","BOUVET.OL",
+            "ENTRA.OL","SATS.OL","OKEA.OL","AGAS.OL","BWO.OL",
+            "KAHOOT.OL","CRAYON.OL","NXTECH.OL","THIN.OL","NSG.OL",
+            "ASETEK.OL","INSR.OL","KIT.OL","LINK.OL","SOFF.OL",
         ],
     },
 
@@ -821,13 +947,17 @@ COUNTRY_JOBS = [
         "url": "https://en.wikipedia.org/wiki/ISEQ_20",
         "cols": ["Ticker", "Symbol"],
         "manual": [
-            # Irish stocks primarily trade in Dublin (.IR) or London (.L)
-            "CRH.L","FLTR.L","ICG.L","BIRG.L","AIB.L","PTSB.L","TDOC.L",
-            "CRH.IR","FLTR.IR","ICG.IR","BIRG.IR","AIB.IR","PTSB.IR",
-            "KORE.IR","ORLA.IR","CPL.IR","DHG.IR","DRV.IR","GLB.IR",
-            "GLV.IR","GOI.IR","IFG.IR","INA.IR","IRM.IR","ISF.IR",
-            "MALIN.IR","MAN.IR","NWL.IR","OGN.IR","SMURFIT.L","TPVG.IR",
-            "AMRG.L","AERCAP.L","DPLM.L","G4M.L","GYM.L","KNDL.L",
+            # Irish companies verified on yfinance — primarily London (.L) listings
+            # CRH moved primary listing to NYSE 2023; Flutter moved to NYSE 2024
+            "CRH","FLTR",                           # NYSE primary listings
+            "CRH.L","FLTR.L","SKG.L","RYA.L",      # also available on LSE
+            "EXPN.L","DCC.L","ICG.L","G4M.L",
+            # Euronext Dublin (.IR) — subset that works on yfinance
+            "BIRG.IR","AIB.IR","BOI.IR","PTSB.IR",
+            "FBD.IR","INM.IR","RDSA.IR","IRM.IR",
+            # Additional Irish large caps on LSE
+            "SMDS.L","SMURFIT.L","MDGH.L","NWL.L",
+            "AERCAP.L","GYM.L","CPL.L","DHG.L",
         ],
     },
 
@@ -881,21 +1011,48 @@ COUNTRY_JOBS = [
 # RUN
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def run_all(jobs: list, parallel: bool = True):
-    if parallel:
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = {executor.submit(extract_country_data, job): job["country"] for job in jobs}
-            for future in as_completed(futures):
-                country = futures[future]
-                try:
-                    future.result()
-                except Exception as e:
-                    log.error(f"FAILED: {country} — {e}")
-    else:
-        for job in jobs:
-            extract_country_data(job)
+# ═══════════════════════════════════════════════════════════════════════════════
+# CONTINENT GROUPS  (use --group to run a subset)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+GROUPS = {
+    "americas": ["USA", "Canada", "Brazil", "Mexico"],
+    "europe":   ["Germany", "France", "UK", "Spain", "Netherlands", "Switzerland",
+                 "Sweden", "Italy", "Denmark", "Norway", "Finland", "Poland",
+                 "Belgium", "Portugal", "Austria", "Ireland"],
+    "asia":     ["Japan", "Australia", "India", "South Korea", "Hong Kong",
+                 "Singapore", "New Zealand", "South Africa"],
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# RUN
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def run_all(jobs: list):
+    """Run all countries one by one with a short pause between each."""
+    clean_double_suffix_from_cache()
+    total = len(jobs)
+    for idx, job in enumerate(jobs, 1):
+        log.info(f"\n[{idx}/{total}] Starting {job['country']}...")
+        extract_country_data(job)
+        if idx < total:
+            log.info(f"   Pausing {INTER_COUNTRY_DELAY}s before next country...")
+            time.sleep(INTER_COUNTRY_DELAY)
+
+def run_group(group_name: str):
+    """Run a continent group only."""
+    group_name = group_name.lower()
+    if group_name not in GROUPS:
+        log.error(f"Unknown group '{group_name}'. Choose from: {list(GROUPS.keys())}")
+        return
+    names = GROUPS[group_name]
+    jobs = [j for j in COUNTRY_JOBS if j["country"] in names]
+    log.info(f"Group '{group_name}': {len(jobs)} countries → {names}")
+    run_all(jobs)
 
 def run_single(country_name: str):
+    """Run a single named country."""
+    clean_double_suffix_from_cache()
     matches = [j for j in COUNTRY_JOBS if j["country"].lower() == country_name.lower()]
     if not matches:
         log.error(f"Country '{country_name}' not found.")
@@ -905,14 +1062,27 @@ def run_single(country_name: str):
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="Global Stock Data Extractor v2")
+    parser = argparse.ArgumentParser(
+        description="Global Stock Data Extractor — sequential, continent-aware",
+        formatter_class=argparse.RawTextHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  python script.py                    # all 28 countries\n"
+            "  python script.py --group europe     # Europe only\n"
+            "  python script.py --group americas   # Americas only\n"
+            "  python script.py --group asia       # Asia-Pacific + Africa\n"
+            "  python script.py --country Brazil   # single country\n"
+        )
+    )
     parser.add_argument("--country", type=str, default=None,
                         help="Run for a single country (e.g. --country Brazil)")
-    parser.add_argument("--sequential", action="store_true",
-                        help="Disable parallel processing")
+    parser.add_argument("--group", type=str, default=None,
+                        help="Run a continent group: americas | europe | asia")
     args = parser.parse_args()
 
     if args.country:
         run_single(args.country)
+    elif args.group:
+        run_group(args.group)
     else:
-        run_all(COUNTRY_JOBS, parallel=not args.sequential)
+        run_all(COUNTRY_JOBS)
