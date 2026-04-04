@@ -1,21 +1,17 @@
 """
-Global Stock Data Extractor v2 — Multi-Country, 50-Year Daily Data
-===================================================================
-Key improvement in v2: COMPLETE manual ticker lists for every country.
-Completeness > automation. The manual lists are the backbone; Wikipedia
-auto-scrape is a bonus top-up. Previously found tickers persist via cache.
-
-Countries covered (28):
-  USA, Germany, France, UK, Spain, Netherlands, Switzerland, Sweden,
-  Italy, Japan, Australia, Canada, Brazil, India, South Korea, Hong Kong,
-  Singapore, Denmark, Norway, Finland, Poland, South Africa, Belgium,
-  Portugal, Austria, Ireland, Mexico, New Zealand
+Global Stock Data Extractor — Multi-Country, 50-Year Daily Data
+===============================================================
+33 countries: USA, Germany, France, UK, Spain, Netherlands, Switzerland,
+Sweden, Italy, Japan, Australia, Canada, Brazil, India, South Korea,
+Hong Kong, Singapore, Denmark, Norway, Finland, Poland, South Africa,
+Belgium, Portugal, Austria, Ireland, Mexico, New Zealand,
+China, Taiwan, Turkey, Indonesia, Saudi Arabia
 
 Run modes:
-  python script.py                         # all 28 countries, sequential
-  python script.py --group europe          # Europe only
-  python script.py --group americas        # Americas only
-  python script.py --group asia            # Asia-Pacific + Africa
+  python script.py                         # all 33 countries, sequential
+  python script.py --group europe          # Europe only (16 countries)
+  python script.py --group americas        # Americas only (4 countries)
+  python script.py --group asia            # Asia-Pacific + MiddleEast + Africa (13)
   python script.py --country Brazil        # single country
 """
 
@@ -36,7 +32,7 @@ START_DATE          = "1976-01-01"
 END_DATE            = datetime.today().strftime("%Y-%m-%d")
 OUTPUT_DIR          = "output"
 CACHE_FILE          = "ticker_cache.json"
-DEAD_FILE           = "dead_tickers.json"
+RETIRED_FILE        = "retired_tickers.json"   # full archive: country/index/reason/date
 MAX_WORKERS         = 1      # Keep at 1 — parallel yf.download() calls mix
                              # up each other's results (thread-safety bug).
 DOWNLOAD_CHUNK      = 50
@@ -60,7 +56,7 @@ EXCHANGE_SUFFIX = {
     "BR": ".SA", "MX": ".MX", "AR": ".BA", "JP": ".T",  "CN": ".SS",
     "HK": ".HK", "KR": ".KS", "AU": ".AX", "NZ": ".NZ", "IN": ".NS",
     "SG": ".SI", "TW": ".TW", "ZA": ".JO", "IL": ".TA", "SA": ".SR",
-    "AE": ".AD", "QA": ".QA",
+    "AE": ".AD", "QA": ".QA", "TR": ".IS", "ID": ".JK",
 }
 
 def get_suffix(country_code: str) -> str:
@@ -90,40 +86,56 @@ def update_cache(index_name: str, tickers: list):
 def get_cached_tickers(index_name: str) -> list:
     return load_cache().get(index_name, [])
 
-# ─── DEAD TICKER REGISTRY ─────────────────────────────────────────────────────
+# ─── RETIRED TICKER ARCHIVE ───────────────────────────────────────────────────
+# Tickers are NEVER deleted — archived with full metadata for later historical
+# download via the companion download_retired_tickers.py script.
+#
+# retired_tickers.json format:
+#   { "JNPR": {"country":"USA","index":"SP500","reason":"delisted_confirmed",
+#              "first_failed":"2026-04-04"}, ... }
 
-def load_dead_set() -> set:
-    """Return the set of confirmed-delisted tickers (skipped on future runs)."""
-    if os.path.exists(DEAD_FILE):
-        with open(DEAD_FILE, "r") as f:
-            return set(json.load(f))
-    return set()
+def load_retired() -> dict:
+    if os.path.exists(RETIRED_FILE):
+        with open(RETIRED_FILE, "r") as f:
+            return json.load(f)
+    return {}
 
-def add_dead_tickers(tickers: list):
-    """Persist confirmed-delisted tickers so they are skipped on future runs."""
+def save_retired(data: dict):
+    with open(RETIRED_FILE, "w") as f:
+        json.dump(data, f, indent=2, sort_keys=True)
+
+def retire_tickers(tickers: list, country: str, index_name: str, reason: str):
+    """Archive confirmed-gone tickers. Never overwrites existing entries."""
     if not tickers:
         return
-    dead = load_dead_set()
-    before = len(dead)
-    dead.update(tickers)
-    if len(dead) > before:
-        with open(DEAD_FILE, "w") as f:
-            json.dump(sorted(dead), f, indent=2)
-        log.info(f"   Dead-ticker list updated: {len(dead)} total ({len(dead)-before} new)")
+    archive = load_retired()
+    today   = datetime.today().strftime("%Y-%m-%d")
+    added   = 0
+    for t in tickers:
+        if t not in archive:
+            archive[t] = {"country": country, "index": index_name,
+                          "reason": reason, "first_failed": today}
+            added += 1
+    if added:
+        save_retired(archive)
+        log.info(f"   Retired-ticker archive: +{added} new (total {len(archive)})")
+
+def load_retired_set() -> set:
+    return set(load_retired().keys())
 
 def clean_double_suffix_from_cache():
-    # Remove tickers with duplicated exchange suffix created by the Wikipedia
-    # scraper bug.  Two patterns are cleaned:
-    #   dash-double:  RI-PA.PA   ABBN-SW.SW   (dash then dot suffix)
-    #   dot-double:   AIR.PA.DE  ASML.AS.AS   (two dot-suffixes concatenated)
+    """Remove malformed tickers from cache created by the Wikipedia scraper bug."""
     import re
-    pat_dash = re.compile(r'^.+-[A-Z]{2,3}\.[A-Z]{2,3}$')
-    pat_dot  = re.compile(r'^.*\.[A-Z]{2,3}\.[A-Z]{2,3}$')
+    pat_dash = re.compile(r'^.+-[A-Z]{2,3}\.[A-Z]{2,3}$')   # RI-PA.PA
+    pat_dot  = re.compile(r'^.*\.[A-Z]{2,3}\.[A-Z]{2,3}$')   # AIR.PA.DE
+    pat_sehk = re.compile(r'^SEHK:')                           # SEHK:700.HK
     cache = load_cache()
     changed = False
     for key in list(cache.keys()):
         clean = [t for t in cache[key]
-                 if not pat_dash.match(t) and not pat_dot.match(t)]
+                 if not pat_dash.match(t)
+                 and not pat_dot.match(t)
+                 and not pat_sehk.match(t)]
         removed = len(cache[key]) - len(clean)
         if removed:
             log.info(f"   Cache cleanup [{key}]: removed {removed} malformed tickers")
@@ -155,9 +167,12 @@ def scrape_wikipedia_tickers(url: str, suffix: str, col_hints: list = None) -> l
                     tickers = []
                     for t in raw_tickers:
                         t = t.strip().split(" ")[0].replace(" ", "").replace("\xa0", "")
-                        if t and not t.startswith("0") and len(t) <= 12:
-                            # Normalize dash-format exchange codes to dot format
-                            # e.g. "ABBN-SW" → "ABBN.SW" when suffix is ".SW"
+                        # Strip exchange-prefix formats e.g. "SEHK:700" → "700"
+                        if ":" in t:
+                            t = t.split(":")[-1]
+                        # Allow numeric codes (HK: 0700, TW: 2330, CN: 600519, etc.)
+                        if t and len(t) <= 12:
+                            # Normalize dash-suffix e.g. "ABBN-SW" → "ABBN.SW"
                             if suffix:
                                 dash_suffix = "-" + suffix.lstrip(".")
                                 if t.endswith(dash_suffix):
@@ -173,13 +188,13 @@ def scrape_wikipedia_tickers(url: str, suffix: str, col_hints: list = None) -> l
 
 # ─── MARKET CAP RANKING ───────────────────────────────────────────────────────
 
-def rank_by_market_cap(tickers: list) -> list:
+def rank_by_market_cap(tickers: list, country: str = "", index_name: str = "") -> list:
     log.info(f"   Ranking {len(tickers)} tickers by market cap...")
     if len(tickers) > 150:
         log.info(f"   Skipping market-cap sort (>{len(tickers)} tickers) — using list order.")
         return tickers
     cap_map = {}
-    dead_found = []
+    confirmed_gone = []
     for i in range(0, len(tickers), DOWNLOAD_CHUNK):
         chunk = tickers[i : i + DOWNLOAD_CHUNK]
         for t in chunk:
@@ -189,15 +204,14 @@ def rank_by_market_cap(tickers: list) -> list:
                 if cap and isinstance(cap, (int, float)) and cap > 0:
                     cap_map[t] = cap
             except Exception as e:
-                # Only permanently blacklist tickers that Yahoo explicitly
-                # confirms are delisted.  "no timezone" is a transient
-                # rate-limit/session error and must NOT be treated as permanent.
+                # Only archive tickers Yahoo explicitly says are delisted.
+                # "no timezone" is transient rate-limiting — never archive those.
                 if "symbol may be delisted" in str(e).lower():
-                    dead_found.append(t)
+                    confirmed_gone.append(t)
             finally:
                 time.sleep(0.05)
         time.sleep(0.5)
-    add_dead_tickers(dead_found)
+    retire_tickers(confirmed_gone, country, index_name, reason="delisted_confirmed")
     ranked = sorted(cap_map, key=cap_map.get, reverse=True)
     unranked = [t for t in tickers if t not in cap_map]
     log.info(f"   Ranked: {len(ranked)} valid | Skipped (no cap data): {len(unranked)}")
@@ -261,16 +275,17 @@ def extract_country_data(job: dict):
     combined = list(set(cached) | set(auto) | set(manual))
     log.info(f"   Combined (cached + auto + manual): {len(combined)} unique tickers")
 
-    # Remove confirmed-delisted tickers before ranking and downloading
-    dead = load_dead_set()
-    combined_clean = [t for t in combined if t not in dead]
+    # Remove retired tickers before ranking — preserved in retired_tickers.json
+    # for later historical download, never permanently deleted.
+    retired = load_retired_set()
+    combined_clean = [t for t in combined if t not in retired]
     if len(combined_clean) < len(combined):
-        log.info(f"   Dead-ticker filter removed {len(combined)-len(combined_clean)} tickers; "
-                 f"{len(combined_clean)} remain")
+        log.info(f"   Retired-ticker filter: skipping {len(combined)-len(combined_clean)} "
+                 f"archived tickers; {len(combined_clean)} remain for download")
     combined = combined_clean
 
     combined = update_cache(index_name, combined)
-    ranked   = rank_by_market_cap(combined)
+    ranked   = rank_by_market_cap(combined, country=country, index_name=index_name)
 
     log.info(f"   Downloading data for {len(ranked)} tickers ({START_DATE} → {END_DATE})...")
     close_df = download_with_retry(ranked, START_DATE, END_DATE)
@@ -897,9 +912,11 @@ COUNTRY_JOBS = [
         "url": "https://en.wikipedia.org/wiki/BEL20",
         "cols": ["Ticker", "Symbol"],
         "manual": [
+            # Verified Euronext Brussels tickers (.BR) — April 2026
             "UCB.BR","KBC.BR","ACKB.BR","ABI.BR","SOLB.BR","COFB.BR","COLR.BR",
-            "ARGX.BR","WDP.BR","BPOST.BR","ELIA.BR","GBLB.BR","ING.BR","LOTB.BR",
-            "MELX.BR","ONTEX.BR","UCB.BR","UMI.BR","XIOR.BR",
+            "ARGX.BR","WDP.BR","BPOST.BR","ELI.BR","GBLB.BR","INGB.BR","LOTB.BR",
+            "MELE.BR","ONTEX.BR","UMI.BR","XIOR.BR",
+            # ELIA.BR → ELI.BR (Elia Group), ING.BR → INGB.BR, MELX.BR → MELE.BR
         ],
     },
 
@@ -913,9 +930,11 @@ COUNTRY_JOBS = [
         "url": "https://en.wikipedia.org/wiki/PSI-20",
         "cols": ["Ticker", "Symbol"],
         "manual": [
+            # Verified Euronext Lisbon (.LS) tickers — April 2026
             "EDP.LS","GALP.LS","BCP.LS","NOS.LS","JMT.LS","SON.LS","EGL.LS",
-            "EDPR.LS","CTT.LS","NVG.LS","ALTR.LS","COR.LS","ELEC.LS","ENGI.LS",
-            "IPMA.LS","MOTA.LS","PHR.LS","RAMB.LS","RENE.LS","TDSA.LS",
+            "EDPR.LS","CTT.LS","NVG.LS","ALTR.LS","COR.LS","RENE.LS","TDSA.LS",
+            "PHR.LS","IBS.LS","GVOLT.LS","NFGS.LS",
+            # Removed (consistently 404): ELEC.LS, ENGI.LS, IPMA.LS, MOTA.LS, RAMB.LS, SONC.LS
         ],
     },
 
@@ -929,11 +948,12 @@ COUNTRY_JOBS = [
         "url": "https://en.wikipedia.org/wiki/Austrian_Traded_Index",
         "cols": ["Ticker", "Symbol"],
         "manual": [
-            "EBS.VI","OMV.VI","VIG.VI","RBI.VI","POST.VI","TKA.VI","EVN.VI",
-            "SBO.VI","AT1.VI","ATS.VI","BG.VI","CAI.VI","DO.VI","EAG.VI",
-            "FMT.VI","GRB.VI","IIA.VI","KAP.VI","LNZ.VI","MIBA.VI","MOS.VI",
-            "NWT.VI","OMV.VI","PAL.VI","PYT.VI","QPS.VI","S.VI","SPI.VI",
-            "TKH.VI","TQQ.VI","UNI.VI","VAS.VI","VER.VI","WIE.VI","ZAG.VI",
+            # Confirmed working on yfinance (.VI = Wiener Börse)
+            "EBS.VI","OMV.VI","VIG.VI","RBI.VI","POST.VI","EVN.VI","SBO.VI",
+            "LNZ.VI","PAL.VI","PYT.VI","WIE.VI","CAI.VI","ATS.VI","BG.VI",
+            "UNI.VI","VER.VI","VAS.VI","ZAG.VI","BAWAG.VI",
+            # Removed (consistently 404/no-timezone): AT1, DO, EAG, FMT, GRB,
+            # IIA, KAP, MIBA, MOS, NWT, QPS, S, SPI, TKH, TQQ, AMS
         ],
     },
 
@@ -1005,6 +1025,134 @@ COUNTRY_JOBS = [
         ],
     },
 
+    # ══════════════════════════════════════════════════════════════
+    # CHINA — CSI 300 / MSCI China
+    # Shanghai Stock Exchange (.SS) + Shenzhen (.SZ) manually added
+    # GitHub ref: MCHI MSCI China ETF iShares
+    # ══════════════════════════════════════════════════════════════
+    {
+        "country": "China",
+        "country_code": "CN",
+        "index_name": "CSI300",
+        "url": "https://en.wikipedia.org/wiki/CSI_300_Index",
+        "cols": ["Code", "Symbol", "Ticker"],
+        "manual": [
+            # Shanghai Stock Exchange (.SS) — CSI 300 / MSCI China large caps
+            "600519.SS","601318.SS","600036.SS","601398.SS","601857.SS","601939.SS",
+            "601288.SS","600030.SS","600276.SS","600887.SS","601166.SS","600900.SS",
+            "601628.SS","601601.SS","601088.SS","601390.SS","600050.SS","601668.SS",
+            "601800.SS","601899.SS","600009.SS","600104.SS","600048.SS","600309.SS",
+            "601919.SS","601186.SS","601328.SS","601111.SS","603259.SS","688599.SS",
+            "600690.SS","601138.SS","600298.SS","601012.SS","600745.SS","600703.SS",
+            "603501.SS","600588.SS","688981.SS","600406.SS","601766.SS","600031.SS",
+            # Shenzhen Stock Exchange (.SZ) — manually added (start with 0/3)
+            "000858.SZ","000333.SZ","002594.SZ","300750.SZ","000001.SZ","002415.SZ",
+            "000002.SZ","300015.SZ","002352.SZ","000651.SZ","300999.SZ","002714.SZ",
+            "000568.SZ","001979.SZ","002475.SZ","000725.SZ","300760.SZ","002230.SZ",
+            "300059.SZ","002304.SZ","000776.SZ","002241.SZ","300014.SZ","002311.SZ",
+        ],
+    },
+
+    # ══════════════════════════════════════════════════════════════
+    # TAIWAN — TWSE Taiwan 50 + MSCI Taiwan
+    # Exchange: Taiwan Stock Exchange (.TW)
+    # GitHub ref: EWT_Taiwan_MSCI_Ishares
+    # ══════════════════════════════════════════════════════════════
+    {
+        "country": "Taiwan",
+        "country_code": "TW",
+        "index_name": "TWSE50",
+        "url": "https://en.wikipedia.org/wiki/TWSE_Taiwan_50",
+        "cols": ["Ticker", "Code", "Symbol"],
+        "manual": [
+            # TWSE Taiwan 50 — all 4-digit codes + .TW
+            "2330.TW","2317.TW","2454.TW","2882.TW","2881.TW","2891.TW","2886.TW",
+            "1303.TW","1301.TW","2308.TW","2412.TW","3711.TW","2357.TW","2382.TW",
+            "2303.TW","2379.TW","1216.TW","2002.TW","2207.TW","3045.TW","2395.TW",
+            "2884.TW","2885.TW","2887.TW","2890.TW","2892.TW","5871.TW","2880.TW",
+            "3034.TW","2325.TW","2408.TW","2301.TW","2353.TW","2376.TW","2371.TW",
+            # MSCI Taiwan extras — large caps beyond Taiwan 50
+            "2327.TW","3008.TW","2474.TW","2344.TW","4904.TW","2498.TW","2610.TW",
+            "2615.TW","2618.TW","2633.TW","3231.TW","3702.TW","4938.TW","5876.TW",
+            "6669.TW","6770.TW","8046.TW","9910.TW","1101.TW","1326.TW","1402.TW",
+        ],
+    },
+
+    # ══════════════════════════════════════════════════════════════
+    # TURKEY — BIST 30 + large caps
+    # Exchange: Borsa Istanbul (.IS)
+    # GitHub ref: Turkey / MSCI Turkey scripts
+    # ══════════════════════════════════════════════════════════════
+    {
+        "country": "Turkey",
+        "country_code": "TR",
+        "index_name": "BIST30",
+        "url": "https://en.wikipedia.org/wiki/BIST_30",
+        "cols": ["Ticker", "Symbol", "Code"],
+        "manual": [
+            # BIST 30 core — verified yfinance .IS symbols
+            "GARAN.IS","AKBNK.IS","THYAO.IS","EREGL.IS","KCHOL.IS","SAHOL.IS",
+            "SISE.IS","TUPRS.IS","ASELS.IS","BIMAS.IS","TCELL.IS","ISCTR.IS",
+            "VAKBN.IS","HALKB.IS","YKBNK.IS","FROTO.IS","TOASO.IS","KOZAL.IS",
+            "SODA.IS","ENKAI.IS","PETKM.IS","ARCLK.IS","MGROS.IS","PGSUS.IS",
+            "CCOLA.IS","EKGYO.IS","ULKER.IS","TAVHL.IS","DOHOL.IS","AGHOL.IS",
+            # BIST 100 large caps
+            "AKSEN.IS","ALARK.IS","ALGYO.IS","BRSAN.IS","CIMSA.IS","DOAS.IS",
+            "EGEEN.IS","EREGL.IS","GESAN.IS","GUBRF.IS","IHLGM.IS","IPEKE.IS",
+            "KARSN.IS","KLNMA.IS","KONTR.IS","LOGO.IS","MPARK.IS","NTHOL.IS",
+            "ODAS.IS","OTKAR.IS","OYAKC.IS","PARSN.IS","SELEC.IS","SOKM.IS",
+            "TATGD.IS","TTKOM.IS","TTRAK.IS","VESTL.IS","ZOREN.IS",
+        ],
+    },
+
+    # ══════════════════════════════════════════════════════════════
+    # INDONESIA — IDX30 / LQ45
+    # Exchange: Indonesia Stock Exchange (.JK)
+    # GitHub ref: MSCI Indonesia
+    # ══════════════════════════════════════════════════════════════
+    {
+        "country": "Indonesia",
+        "country_code": "ID",
+        "index_name": "IDX30",
+        "url": "https://en.wikipedia.org/wiki/IDX_Composite",
+        "cols": ["Ticker", "Symbol", "Code"],
+        "manual": [
+            # IDX30 / LQ45 — verified yfinance .JK symbols
+            "BBCA.JK","BBRI.JK","TLKM.JK","BMRI.JK","ASII.JK","BBNI.JK",
+            "GOTO.JK","ICBP.JK","UNVR.JK","KLBF.JK","GGRM.JK","PGAS.JK",
+            "ADRO.JK","INCO.JK","EXCL.JK","SMGR.JK","JSMR.JK","PTBA.JK",
+            "ITMG.JK","INDF.JK","MNCN.JK","HMSP.JK","INKP.JK","TKIM.JK",
+            "BSDE.JK","PWON.JK","BREN.JK","CPIN.JK","AMMN.JK","ANTM.JK",
+            "MDKA.JK","ESSA.JK","BRPT.JK","MAPI.JK","SMRA.JK","CTRA.JK",
+            "WIKA.JK","ADHI.JK","PTPP.JK","WSKT.JK","BBTN.JK","BDMN.JK",
+            "BJBR.JK","BJTM.JK","NISP.JK","BNII.JK","MEGA.JK","PNBN.JK",
+        ],
+    },
+
+    # ══════════════════════════════════════════════════════════════
+    # SAUDI ARABIA — Tadawul All Share Index (TASI)
+    # Exchange: Saudi Exchange (.SR)
+    # GitHub ref: MSCI Saudi Arabia Ishares
+    # ══════════════════════════════════════════════════════════════
+    {
+        "country": "Saudi Arabia",
+        "country_code": "SA",
+        "index_name": "TASI",
+        "url": "https://en.wikipedia.org/wiki/Tadawul_All_Share_Index",
+        "cols": ["Ticker", "Symbol", "Code"],
+        "manual": [
+            # TASI large caps — verified yfinance .SR symbols (4-digit codes)
+            "2222.SR","1120.SR","1180.SR","2350.SR","1010.SR","1030.SR",
+            "1211.SR","4190.SR","1050.SR","2010.SR","3030.SR","4030.SR",
+            "1020.SR","1060.SR","4300.SR","2040.SR","2060.SR","1080.SR",
+            "4050.SR","4240.SR","4170.SR","4160.SR","1150.SR","2330.SR",
+            "3020.SR","3060.SR","4280.SR","4001.SR","8010.SR","4200.SR",
+            "2280.SR","2020.SR","4030.SR","1010.SR","4130.SR","4140.SR",
+            "4150.SR","4180.SR","4220.SR","4260.SR","4270.SR","4290.SR",
+            "4310.SR","4320.SR","4330.SR","4340.SR","4345.SR","4347.SR",
+        ],
+    },
+
 ]
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1021,7 +1169,8 @@ GROUPS = {
                  "Sweden", "Italy", "Denmark", "Norway", "Finland", "Poland",
                  "Belgium", "Portugal", "Austria", "Ireland"],
     "asia":     ["Japan", "Australia", "India", "South Korea", "Hong Kong",
-                 "Singapore", "New Zealand", "South Africa"],
+                 "Singapore", "New Zealand", "South Africa",
+                 "China", "Taiwan", "Turkey", "Indonesia", "Saudi Arabia"],
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
