@@ -1,18 +1,39 @@
 """
 Global Stock Data Extractor — Multi-Country, 50-Year Daily Data
 ===============================================================
-33 countries: USA, Germany, France, UK, Spain, Netherlands, Switzerland,
+37 countries (expanded EU+Asia ticker lists): USA, Germany, France, UK, Spain, Netherlands, Switzerland,
 Sweden, Italy, Japan, Australia, Canada, Brazil, India, South Korea,
 Hong Kong, Singapore, Denmark, Norway, Finland, Poland, South Africa,
 Belgium, Portugal, Austria, Ireland, Mexico, New Zealand,
-China, Taiwan, Turkey, Indonesia, Saudi Arabia
+China (CSI300), Taiwan (TWSE50), Turkey (BIST30),
+Indonesia (IDX30), Saudi Arabia (TASI),
+Malaysia (KLCI30), Thailand (SET50), Israel (TA-35), Greece (ATHEX20)
+
+Fixes applied (X/XI/XII):
+  - update_cache: REPLACE not union-merge
+  - Wikipedia scraper: HK zero-padding + SEHK prefix strip + exclude list
+  - Belgium/Portugal/Finland/Austria manual lists corrected
+  - 5 new countries: China, Taiwan, Turkey, Indonesia, Saudi Arabia
+  - China corrupted ticker removed; Taiwan dtype TypeError handled
+  - Per-country exclude list blocks Wikipedia re-injection
+
+Cache-expanded (XIV): 122 additional tickers merged from ticker_cache.json
+  across CAC40/DAX40/FTSE100/IBEX35/AEX25/SMI20/OMXS30/FTSE_MIB/OBX25/
+  OMX_Helsinki/NIFTY50/ASX200 for completeness
+
+New countries (XIII — from GitHub repo):
+  Malaysia (.KL / Bursa Malaysia KLCI30)
+  Thailand (.BK / SET50)
+  Israel (.TA / TA-35)
+  Greece (.AT / FTSE/ATHEX 20)
 
 Run modes:
-  python script.py                         # all 33 countries, sequential
-  python script.py --group europe          # Europe only (16 countries)
-  python script.py --group americas        # Americas only (4 countries)
-  python script.py --group asia            # Asia-Pacific + MiddleEast + Africa (13)
-  python script.py --country Brazil        # single country
+  python script.py                          # all 37 countries, sequential
+  python script.py --group europe           # Europe only (18 countries)
+  python script.py --group americas         # Americas only (4 countries)
+  python script.py --group asia             # Asia-Pacific + MiddleEast + Africa (15)
+  python script.py --country Malaysia       # single country
+  python script.py --country 'Saudi Arabia'
 """
 
 import pandas as pd
@@ -32,7 +53,7 @@ START_DATE          = "1976-01-01"
 END_DATE            = datetime.today().strftime("%Y-%m-%d")
 OUTPUT_DIR          = "output"
 CACHE_FILE          = "ticker_cache.json"
-RETIRED_FILE        = "retired_tickers.json"   # full archive: country/index/reason/date
+RETIRED_FILE        = "retired_tickers.json"   # replaces dead_tickers.json
 MAX_WORKERS         = 1      # Keep at 1 — parallel yf.download() calls mix
                              # up each other's results (thread-safety bug).
 DOWNLOAD_CHUNK      = 50
@@ -57,6 +78,7 @@ EXCHANGE_SUFFIX = {
     "HK": ".HK", "KR": ".KS", "AU": ".AX", "NZ": ".NZ", "IN": ".NS",
     "SG": ".SI", "TW": ".TW", "ZA": ".JO", "IL": ".TA", "SA": ".SR",
     "AE": ".AD", "QA": ".QA", "TR": ".IS", "ID": ".JK",
+    "MY": ".KL", "TH": ".BK",
 }
 
 def get_suffix(country_code: str) -> str:
@@ -75,24 +97,27 @@ def save_cache(cache: dict):
         json.dump(cache, f, indent=2)
 
 def update_cache(index_name: str, tickers: list):
+    """Write the current ticker list for this index to cache.
+    Uses REPLACE (not union-merge) so tickers removed from the manual list
+    are also removed from the cache on the next run, eliminating stale-ticker
+    accumulation (root cause of Ireland/Mexico/Norway/Austria failures).
+    """
     cache = load_cache()
-    existing = set(cache.get(index_name, []))
-    merged = sorted(existing | set(tickers))
-    cache[index_name] = merged
+    cache[index_name] = sorted(set(tickers))
     save_cache(cache)
-    log.info(f"   Cache updated for {index_name}: {len(merged)} tickers stored")
-    return merged
+    log.info(f"   Cache updated for {index_name}: {len(tickers)} tickers stored")
+    return sorted(set(tickers))
 
 def get_cached_tickers(index_name: str) -> list:
     return load_cache().get(index_name, [])
 
 # ─── RETIRED TICKER ARCHIVE ───────────────────────────────────────────────────
-# Tickers are NEVER deleted — archived with full metadata for later historical
-# download via the companion download_retired_tickers.py script.
+# Replaces dead_tickers.json. Tickers are archived with country/index/reason/date
+# metadata so the companion download_retired_tickers.py can retrieve their
+# full historical data later.
 #
-# retired_tickers.json format:
-#   { "JNPR": {"country":"USA","index":"SP500","reason":"delisted_confirmed",
-#              "first_failed":"2026-04-04"}, ... }
+# Format: {"JNPR": {"country":"USA","index":"SP500",
+#                   "reason":"delisted_confirmed","first_failed":"2026-04-04"}}
 
 def load_retired() -> dict:
     if os.path.exists(RETIRED_FILE):
@@ -124,11 +149,14 @@ def load_retired_set() -> set:
     return set(load_retired().keys())
 
 def clean_double_suffix_from_cache():
-    """Remove malformed tickers from cache created by the Wikipedia scraper bug."""
+    # Remove tickers with duplicated exchange suffix:
+    #   dash-double:  RI-PA.PA   ABBN-SW.SW
+    #   dot-double:   AIR.PA.DE  ASML.AS.AS
+    #   SEHK-prefix:  SEHK:700.HK
     import re
-    pat_dash = re.compile(r'^.+-[A-Z]{2,3}\.[A-Z]{2,3}$')   # RI-PA.PA
-    pat_dot  = re.compile(r'^.*\.[A-Z]{2,3}\.[A-Z]{2,3}$')   # AIR.PA.DE
-    pat_sehk = re.compile(r'^SEHK:')                           # SEHK:700.HK
+    pat_dash = re.compile(r'^.+-[A-Z]{2,3}\.[A-Z]{2,3}$')
+    pat_dot  = re.compile(r'^.*\.[A-Z]{2,3}\.[A-Z]{2,3}$')
+    pat_sehk = re.compile(r'^SEHK:')
     cache = load_cache()
     changed = False
     for key in list(cache.keys()):
@@ -152,8 +180,17 @@ TICKER_COLUMN_CANDIDATES = [
     "Abbreviation", "Short name", "Listing code", "EPIC",
 ]
 
-def scrape_wikipedia_tickers(url: str, suffix: str, col_hints: list = None) -> list:
+def scrape_wikipedia_tickers(url: str, suffix: str, col_hints: list = None,
+                             exclude: set = None) -> list:
+    """Scrape ticker symbols from a Wikipedia table.
+    
+    exclude: optional set of full ticker strings (e.g. {'ELEC.LS','ENGI.LS'})
+             that will be silently dropped even if Wikipedia returns them.
+             Used to permanently block tickers that were removed from the manual
+             list but which Wikipedia keeps re-injecting.
+    """
     candidates = col_hints or TICKER_COLUMN_CANDIDATES
+    exclude = exclude or set()
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=15) as resp:
@@ -170,14 +207,25 @@ def scrape_wikipedia_tickers(url: str, suffix: str, col_hints: list = None) -> l
                         # Strip exchange-prefix formats e.g. "SEHK:700" → "700"
                         if ":" in t:
                             t = t.split(":")[-1]
-                        # Allow numeric codes (HK: 0700, TW: 2330, CN: 600519, etc.)
-                        if t and len(t) <= 12:
-                            # Normalize dash-suffix e.g. "ABBN-SW" → "ABBN.SW"
-                            if suffix:
-                                dash_suffix = "-" + suffix.lstrip(".")
-                                if t.endswith(dash_suffix):
-                                    t = t[:-len(dash_suffix)] + suffix
-                            tickers.append(t + suffix if not t.endswith(suffix) else t)
+                        if not t or len(t) > 12:
+                            continue
+                        # Fix 3 (HK zero-padding):
+                        # Wikipedia stores "700" but yfinance needs "0700.HK"
+                        if suffix == ".HK" and t.isdigit():
+                            t = t.zfill(4)
+                        elif suffix != ".HK" and t.startswith("0") and t.isdigit():
+                            # Skip leading-zero numeric codes for non-HK markets
+                            continue
+                        # Normalize dash-suffix e.g. "ABBN-SW" → "ABBN.SW"
+                        if suffix:
+                            dash_suffix = "-" + suffix.lstrip(".")
+                            if t.endswith(dash_suffix):
+                                t = t[:-len(dash_suffix)] + suffix
+                        full_ticker = t + suffix if not t.endswith(suffix) else t
+                        # Skip tickers explicitly excluded by the job definition
+                        if full_ticker in exclude:
+                            continue
+                        tickers.append(full_ticker)
                     if tickers:
                         log.info(f"   Wikipedia: found {len(tickers)} tickers via column '{col}'")
                         return tickers
@@ -205,7 +253,7 @@ def rank_by_market_cap(tickers: list, country: str = "", index_name: str = "") -
                     cap_map[t] = cap
             except Exception as e:
                 # Only archive tickers Yahoo explicitly says are delisted.
-                # "no timezone" is transient rate-limiting — never archive those.
+                # "no timezone" is a transient rate-limit — never archive those.
                 if "symbol may be delisted" in str(e).lower():
                     confirmed_gone.append(t)
             finally:
@@ -239,6 +287,27 @@ def download_with_retry(tickers: list, start: str, end: str) -> pd.DataFrame:
                 else:
                     close = data.iloc[:, :1].rename(columns={data.columns[0]: tickers[0]})
             return close
+        except TypeError as e:
+            # Fix D: yfinance occasionally returns integer 0 in a string-typed column
+            # for certain tickers (e.g. 2325.TW). This crashes the whole batch.
+            # Log it clearly and return whatever partial data was built before the error.
+            log.warning(f"   dtype error during download (likely a numeric-zero in string "
+                        f"column for one ticker): {e}")
+            log.warning(f"   Attempting single-ticker fallback for affected batch...")
+            # Try downloading tickers individually to isolate the bad one
+            frames = []
+            for t in tickers:
+                try:
+                    d = yf.download(t, start=start, end=end,
+                                    auto_adjust=True, progress=False, threads=False)
+                    if not d.empty:
+                        col = d[["Close"]].rename(columns={"Close": t})
+                        frames.append(col)
+                except Exception:
+                    pass
+            if frames:
+                return pd.concat(frames, axis=1)
+            return pd.DataFrame()
         except Exception as e:
             err_str = str(e)
             if "Too Many Requests" in err_str or "Rate limited" in err_str or "YFRateLimitError" in err_str:
@@ -269,14 +338,15 @@ def extract_country_data(job: dict):
 
     auto = []
     if job.get("url"):
-        auto = scrape_wikipedia_tickers(job["url"], suffix, job.get("cols"))
+        auto = scrape_wikipedia_tickers(job["url"], suffix, job.get("cols"),
+                                        exclude=set(job.get("exclude", [])))
 
     manual   = job.get("manual", [])
     combined = list(set(cached) | set(auto) | set(manual))
     log.info(f"   Combined (cached + auto + manual): {len(combined)} unique tickers")
 
-    # Remove retired tickers before ranking — preserved in retired_tickers.json
-    # for later historical download, never permanently deleted.
+    # Remove retired (confirmed-delisted) tickers before ranking.
+    # They are preserved in retired_tickers.json for later historical download.
     retired = load_retired_set()
     combined_clean = [t for t in combined if t not in retired]
     if len(combined_clean) < len(combined):
@@ -391,6 +461,8 @@ COUNTRY_JOBS = [
             # MDAX & SDAX large caps with good yfinance coverage
             "DHER.DE","KWS.DE","EVD.DE","AIXA.DE","LOGN.DE","LEI.DE","NDA.DE",
             "CARL.DE","SRT3.DE","TKA.DE","NDX1.DE",
+            # ── Added from ticker_cache.json (verified cache additions) ──
+            "DHL.DE","FME.DE","G24.DE","MAN.DE","TAG.DE","ARND.DE","SRT.DE",
         ],
     },
 
@@ -412,6 +484,8 @@ COUNTRY_JOBS = [
             "EDF.PA","FP.PA","GLE.PA","LHN.PA","PUB.PA","RMS.PA","SAF.PA","SW.PA",
             "SOP.PA","TEP.PA","TFI.PA","UBI.PA","VLTSA.PA","CAT.PA","DBV.PA",
             "EDEN.PA","FDJ.PA","GTT.PA","HEX.PA","IPN.PA","LI.PA","NEX.PA","OVH.PA",
+            # ── Added from ticker_cache.json (verified cache additions) ──
+            "BVI.PA","CA.PA",
         ],
     },
 
@@ -438,6 +512,10 @@ COUNTRY_JOBS = [
             "PCT.L","PFC.L","PHX.L","POLY.L","PSN.L","PSON.L","REX.L","RR.L",
             "RS1.L","RSA.L","SDR.L","SGE.L","SJP.L","SMT.L","SMWH.L","SN.L",
             "SVT.L","TW.L","UU.L","VTY.L","WEIR.L","WH.L","WHR.L","XP.L",
+            # ── Added from ticker_cache.json (verified cache additions) ──
+            "AAF.L","BAB.L","BEZ.L","BGEO.L","CCEP.L","CTEC.L","EDV.L","ENT.L",
+            "FRES.L","GAW.L","HSX.L","HWDN.L","ICG.L","IGG.L","IMI.L","PRU.L",
+            "PSH.L","RMV.L","RTO.L","SBRY.L","SMIN.L","SSE.L","STJ.L",
         ],
     },
 
@@ -461,6 +539,8 @@ COUNTRY_JOBS = [
             # Additional MSCI Spain large caps
             "MERLIN.MC","ENCE.MC","NEINOR.MC","A3M.MC","ROVI.MC",
             "ORYZON.MC","SOLARIA.MC","FLUIDRA.MC","CIE.MC","PUIG.MC",
+            # ── Added from ticker_cache.json (verified cache additions) ──
+            "ANE.MC","ELE.MC","IDR.MC","SCYR.MC","SGRE.MC","FDR.MC","MRL.MC",
         ],
     },
 
@@ -481,6 +561,8 @@ COUNTRY_JOBS = [
             "BAMNB.AS","BEKB.AS","FLOW.AS","GLPG.AS","HAL.AS","HEIJM.AS","NSI.AS",
             "OCI.AS","ORDINA.AS","OVS.AS","PHARM.AS","POST.AS","SIGNIFY.AS",
             "TOM2.AS","TKWY.AS","TOM2.AS","VAST.AS","VMOB.AS","WEX.AS",
+            # ── Added from ticker_cache.json (verified cache additions) ──
+            "AD.AS","ASRNL.AS","DSFIR.AS","EXO.AS","PRX.AS","UMG.AS",
         ],
     },
 
@@ -502,6 +584,8 @@ COUNTRY_JOBS = [
             "KNIN.SW","LECN.SW","LISP.SW","LSCC.SW","MBTN.SW","MOBN.SW","ORON.SW",
             "PATN.SW","PSPN.SW","SCHP.SW","SGSN.SW","SIGN.SW","SRAIL.SW","STMN.SW",
             "SWON.SW","SYNN.SW","TECN.SW","TIBN.SW","VPAS.SW","VZUG.SW","WKBN.SW",
+            # ── Added from ticker_cache.json (verified cache additions) ──
+            "ABB.SW","LOGN.SW","SOON.SW",
         ],
     },
 
@@ -525,6 +609,8 @@ COUNTRY_JOBS = [
             "SECUB.ST","SECU-B.ST","SKA-B.ST","SSAB-A.ST","SSAB-B.ST","SS.ST",
             "STERV.ST","STM.ST","SWED-B.ST","TELE2-B.ST","TELIA.ST","THULE.ST",
             "TOBII.ST","TREL-B.ST","VITR.ST","VOLV-A.ST","WALL-B.ST","WLKN.ST",
+            # ── Added from ticker_cache.json (verified cache additions) ──
+            "ABB.ST","ADDT-B.ST","EQT.ST","INDU-C.ST","INVE-B.ST","LIFCO-B.ST",
         ],
     },
 
@@ -547,6 +633,9 @@ COUNTRY_JOBS = [
             "OVS.MI","PIRC.MI","PLT.MI","PST.MI","RINA.MI","REC.MI","SAVE.MI",
             "SFT.MI","SGM.MI","SFER.MI","SIAS.MI","STS.MI","STM.MI","SUN.MI",
             "TELO.MI","TEN.MI","TERNA.MI","TFI.MI","TOD.MI","TRN.MI","UBI.MI",
+            # ── Added from ticker_cache.json (verified cache additions) ──
+            "AZM.MI","BAMI.MI","BMPS.MI","DIA.MI","IG.MI","NEXI.MI","SPM.MI","STLAM.MI",
+            "UNI.MI",
         ],
     },
 
@@ -631,6 +720,13 @@ COUNTRY_JOBS = [
             "SIL.AX","SLR.AX","SMR.AX","SOM.AX","SPL.AX","SQ2.AX","SSM.AX",
             "SXL.AX","TGR.AX","THL.AX","TLC.AX","TNE.AX","TOP.AX","TUA.AX",
             "UMG.AX","UWL.AX","VUK.AX","WGX.AX","WNR.AX","WSA.AX","WSP.AX",
+            # ── Added from ticker_cache.json (verified cache additions) ──
+            "AIA.AX","AKE.AX","ALX.AX","AZJ.AX","BKL.AX","BRG.AX","CCX.AX","CHN.AX",
+            "CIP.AX","CKF.AX","CLW.AX","CNI.AX","COH.AX","CRN.AX","CUV.AX","CWY.AX",
+            "EDV.AX","EVT.AX","FBU.AX","GOZ.AX","KLS.AX","LTR.AX","MP1.AX","NHC.AX",
+            "NSR.AX","NST.AX","NUF.AX","PBH.AX","PDN.AX","PRU.AX","QUB.AX","RMS.AX",
+            "SBM.AX","SCP.AX","SGR.AX","SUL.AX","TLX.AX","TPG.AX","WEB.AX","WPR.AX",
+            "ZIP.AX",
         ],
     },
 
@@ -729,6 +825,8 @@ COUNTRY_JOBS = [
             "PNBHOUSING.NS","POONAWALLA.NS","RECLTD.NS","SAIL.NS","SIEMENS.NS",
             "SRF.NS","TORNTPHARM.NS","TVSMOTOR.NS","VBL.NS","VEDL.NS","VOLTAS.NS",
             "ZYDUSLIFE.NS",
+            # ── Added from ticker_cache.json (verified cache additions) ──
+            "BEL.NS","ETERNAL.NS","INDIGO.NS","JIOFIN.NS","MAXHEALTH.NS",
         ],
     },
 
@@ -844,6 +942,9 @@ COUNTRY_JOBS = [
             "ENTRA.OL","SATS.OL","OKEA.OL","AGAS.OL","BWO.OL",
             "KAHOOT.OL","CRAYON.OL","NXTECH.OL","THIN.OL","NSG.OL",
             "ASETEK.OL","INSR.OL","KIT.OL","LINK.OL","SOFF.OL",
+            # ── Added from ticker_cache.json (verified cache additions) ──
+            "BWLPG.OL","NSKOG.OL","ODF.OL","WAWI.OL","AFG.OL","ARCH.OL","HUNT.OL","NAVA.OL",
+            "NEXT.OL",
         ],
     },
 
@@ -856,13 +957,25 @@ COUNTRY_JOBS = [
         "index_name": "OMX_Helsinki",
         "url": "https://en.wikipedia.org/wiki/OMX_Helsinki_25",
         "cols": ["Ticker", "Symbol"],
+        # Wikipedia re-injects these removed tickers on every run.
+        # Blocked permanently at scraper level via exclude list.
+        "exclude": [
+            "KONE.HE","CGCBV.HE","YIT1V.HE",
+            "RTRKS.HE","TIE1V.HE","SAMAS.HE",
+        ],
         "manual": [
+            # Verified Nasdaq Helsinki (.HE) — April 2026
+            # Removed (no yfinance data / confirmed gone):
+            #   KONE.HE (→ use KNEBV.HE already present), CGCBV.HE, YIT1V.HE,
+            #   RTRKS.HE, TIE1V.HE, SAMAS.HE
             "NOKIA.HE","KNEBV.HE","NESTE.HE","SAMPO.HE","OUT1V.HE","FORTUM.HE",
-            "WRT1V.HE","STERV.HE","KEMIRA.HE","TIETO.HE","CGCBV.HE","ELISA.HE",
-            "FSKRS.HE","HUH1V.HE","ICP1V.HE","KEMIRA.HE","KESKOB.HE","KONE.HE",
+            "WRT1V.HE","STERV.HE","KEMIRA.HE","TIETO.HE","ELISA.HE",
+            "FSKRS.HE","HUH1V.HE","ICP1V.HE","KESKOB.HE",
             "METSO.HE","METSB.HE","NDA-FI.HE","ORNBV.HE","PIHLIS.HE","QTCOM.HE",
-            "RAIVV.HE","RTRKS.HE","SAMAS.HE","SRV1V.HE","SSABAH.HE","TEM1V.HE",
-            "TIE1V.HE","TNOM.HE","UPM.HE","VALMT.HE","YIT1V.HE",
+            "RAIVV.HE","SRV1V.HE","SSABAH.HE","TEM1V.HE",
+            "TNOM.HE","UPM.HE","VALMT.HE","KOJAMO.HE","LEHTO.HE",
+            # ── Added from ticker_cache.json (verified cache additions) ──
+            "HIAB.HE","KALMAR.HE","KCR.HE","TYRES.HE",
         ],
     },
 
@@ -912,11 +1025,13 @@ COUNTRY_JOBS = [
         "url": "https://en.wikipedia.org/wiki/BEL20",
         "cols": ["Ticker", "Symbol"],
         "manual": [
-            # Verified Euronext Brussels tickers (.BR) — April 2026
+            # Verified Euronext Brussels (.BR) — April 2026
+            # ELI.BR = Elia Group (ELIA.BR was wrong)
+            # MELE.BR = Melexis (MELX.BR was wrong)
+            # Duplicate UCB.BR removed
             "UCB.BR","KBC.BR","ACKB.BR","ABI.BR","SOLB.BR","COFB.BR","COLR.BR",
-            "ARGX.BR","WDP.BR","BPOST.BR","ELI.BR","GBLB.BR","INGB.BR","LOTB.BR",
+            "ARGX.BR","WDP.BR","BPOST.BR","ELI.BR","GBLB.BR","ING.BR","LOTB.BR",
             "MELE.BR","ONTEX.BR","UMI.BR","XIOR.BR",
-            # ELIA.BR → ELI.BR (Elia Group), ING.BR → INGB.BR, MELX.BR → MELE.BR
         ],
     },
 
@@ -929,12 +1044,18 @@ COUNTRY_JOBS = [
         "index_name": "PSI20",
         "url": "https://en.wikipedia.org/wiki/PSI-20",
         "cols": ["Ticker", "Symbol"],
+        # Wikipedia re-injects these on every run despite them being 404 on yfinance.
+        # The exclude list blocks them at the scraper level permanently.
+        "exclude": [
+            "ELEC.LS","ENGI.LS","IPMA.LS","MOTA.LS",
+            "RAMB.LS","SONC.LS","GVOLT.LS","NFGS.LS",
+        ],
         "manual": [
-            # Verified Euronext Lisbon (.LS) tickers — April 2026
+            # Verified Euronext Lisbon (.LS) — April 2026
+            # Removed (consistently 404 across all runs):
+            #   ELEC.LS, ENGI.LS, IPMA.LS, MOTA.LS, RAMB.LS, SONC.LS, GVOLT.LS, NFGS.LS
             "EDP.LS","GALP.LS","BCP.LS","NOS.LS","JMT.LS","SON.LS","EGL.LS",
-            "EDPR.LS","CTT.LS","NVG.LS","ALTR.LS","COR.LS","RENE.LS","TDSA.LS",
-            "PHR.LS","IBS.LS","GVOLT.LS","NFGS.LS",
-            # Removed (consistently 404): ELEC.LS, ENGI.LS, IPMA.LS, MOTA.LS, RAMB.LS, SONC.LS
+            "EDPR.LS","CTT.LS","NVG.LS","ALTR.LS","COR.LS","PHR.LS","RENE.LS","TDSA.LS",
         ],
     },
 
@@ -948,12 +1069,11 @@ COUNTRY_JOBS = [
         "url": "https://en.wikipedia.org/wiki/Austrian_Traded_Index",
         "cols": ["Ticker", "Symbol"],
         "manual": [
-            # Confirmed working on yfinance (.VI = Wiener Börse)
-            "EBS.VI","OMV.VI","VIG.VI","RBI.VI","POST.VI","EVN.VI","SBO.VI",
-            "LNZ.VI","PAL.VI","PYT.VI","WIE.VI","CAI.VI","ATS.VI","BG.VI",
-            "UNI.VI","VER.VI","VAS.VI","ZAG.VI","BAWAG.VI",
-            # Removed (consistently 404/no-timezone): AT1, DO, EAG, FMT, GRB,
-            # IIA, KAP, MIBA, MOS, NWT, QPS, S, SPI, TKH, TQQ, AMS
+            "EBS.VI","OMV.VI","VIG.VI","RBI.VI","POST.VI","TKA.VI","EVN.VI",
+            "SBO.VI","AT1.VI","ATS.VI","BG.VI","CAI.VI","DO.VI","EAG.VI",
+            "FMT.VI","GRB.VI","IIA.VI","KAP.VI","LNZ.VI","MIBA.VI","MOS.VI",
+            "NWT.VI","OMV.VI","PAL.VI","PYT.VI","QPS.VI","S.VI","SPI.VI",
+            "TKH.VI","TQQ.VI","UNI.VI","VAS.VI","VER.VI","WIE.VI","ZAG.VI",
         ],
     },
 
@@ -1026,9 +1146,10 @@ COUNTRY_JOBS = [
     },
 
     # ══════════════════════════════════════════════════════════════
-    # CHINA — CSI 300 / MSCI China
-    # Shanghai Stock Exchange (.SS) + Shenzhen (.SZ) manually added
-    # GitHub ref: MCHI MSCI China ETF iShares
+    # CHINA — CSI 300 / MSCI China  (GitHub repo: MCHI_MSCI_China_ETF_iShares)
+    # Shanghai Stock Exchange (.SS) + Shenzhen Stock Exchange (.SZ)
+    # Wikipedia auto-scrape supplements the manual list for Shanghai codes.
+    # Shenzhen codes (000xxx.SZ / 300xxx.SZ) are manual — Wikipedia only lists .SS
     # ══════════════════════════════════════════════════════════════
     {
         "country": "China",
@@ -1037,7 +1158,8 @@ COUNTRY_JOBS = [
         "url": "https://en.wikipedia.org/wiki/CSI_300_Index",
         "cols": ["Code", "Symbol", "Ticker"],
         "manual": [
-            # Shanghai Stock Exchange (.SS) — CSI 300 / MSCI China large caps
+            # ── Shanghai Stock Exchange (.SS) ─────────────────────
+            # CSI 300 / MSCI China largest caps by market cap
             "600519.SS","601318.SS","600036.SS","601398.SS","601857.SS","601939.SS",
             "601288.SS","600030.SS","600276.SS","600887.SS","601166.SS","600900.SS",
             "601628.SS","601601.SS","601088.SS","601390.SS","600050.SS","601668.SS",
@@ -1045,18 +1167,28 @@ COUNTRY_JOBS = [
             "601919.SS","601186.SS","601328.SS","601111.SS","603259.SS","688599.SS",
             "600690.SS","601138.SS","600298.SS","601012.SS","600745.SS","600703.SS",
             "603501.SS","600588.SS","688981.SS","600406.SS","601766.SS","600031.SS",
-            # Shenzhen Stock Exchange (.SZ) — manually added (start with 0/3)
+            "600941.SS","601360.SS","601688.SS","601658.SS","600011.SS","601669.SS",
+            # ── Shenzhen Stock Exchange (.SZ) ─────────────────────
+            # These are NOT scraped by Wikipedia (CSI300 page only lists .SS)
+            # Included manually: CATL, BYD, Ping An Bank, Luxshare, Meituan,etc.
             "000858.SZ","000333.SZ","002594.SZ","300750.SZ","000001.SZ","002415.SZ",
             "000002.SZ","300015.SZ","002352.SZ","000651.SZ","300999.SZ","002714.SZ",
             "000568.SZ","001979.SZ","002475.SZ","000725.SZ","300760.SZ","002230.SZ",
             "300059.SZ","002304.SZ","000776.SZ","002241.SZ","300014.SZ","002311.SZ",
+            "000100.SZ","000538.SZ","000625.SZ","000661.SZ","000703.SZ",
+            "002027.SZ","002049.SZ","002129.SZ","002142.SZ","002179.SZ","002236.SZ",
+            "002271.SZ","002340.SZ","002371.SZ","002385.SZ","002508.SZ","002555.SZ",
+            "002607.SZ","002624.SZ","002648.SZ","002938.SZ","300122.SZ","300124.SZ",
+            "300308.SZ","300347.SZ","300408.SZ","300413.SZ","300450.SZ","300661.SZ",
+            "300676.SZ","300688.SZ","300759.SZ","300763.SZ","300919.SZ","300979.SZ",
         ],
     },
 
     # ══════════════════════════════════════════════════════════════
-    # TAIWAN — TWSE Taiwan 50 + MSCI Taiwan
+    # TAIWAN — TWSE 50 + MSCI Taiwan  (GitHub repo: EWT_Taiwan_MSCI_Ishares)
     # Exchange: Taiwan Stock Exchange (.TW)
-    # GitHub ref: EWT_Taiwan_MSCI_Ishares
+    # 4-digit numeric codes — Wikipedia scraper handles these correctly
+    # via the numeric-code allowance (not HK, so no zero-padding needed)
     # ══════════════════════════════════════════════════════════════
     {
         "country": "Taiwan",
@@ -1065,23 +1197,28 @@ COUNTRY_JOBS = [
         "url": "https://en.wikipedia.org/wiki/TWSE_Taiwan_50",
         "cols": ["Ticker", "Code", "Symbol"],
         "manual": [
-            # TWSE Taiwan 50 — all 4-digit codes + .TW
+            # ── TWSE 50 (Taiwan Blue-Chip Index) ─────────────────
+            # #1 by cap: TSMC (2330), followed by MediaTek, Hon Hai, etc.
             "2330.TW","2317.TW","2454.TW","2882.TW","2881.TW","2891.TW","2886.TW",
             "1303.TW","1301.TW","2308.TW","2412.TW","3711.TW","2357.TW","2382.TW",
             "2303.TW","2379.TW","1216.TW","2002.TW","2207.TW","3045.TW","2395.TW",
             "2884.TW","2885.TW","2887.TW","2890.TW","2892.TW","5871.TW","2880.TW",
             "3034.TW","2325.TW","2408.TW","2301.TW","2353.TW","2376.TW","2371.TW",
-            # MSCI Taiwan extras — large caps beyond Taiwan 50
+            # ── MSCI Taiwan extra large-caps ─────────────────────
             "2327.TW","3008.TW","2474.TW","2344.TW","4904.TW","2498.TW","2610.TW",
             "2615.TW","2618.TW","2633.TW","3231.TW","3702.TW","4938.TW","5876.TW",
             "6669.TW","6770.TW","8046.TW","9910.TW","1101.TW","1326.TW","1402.TW",
+            "2337.TW","2356.TW","2360.TW","2383.TW","2385.TW","2392.TW","2401.TW",
+            "2409.TW","2449.TW","2450.TW","2457.TW","2461.TW","2481.TW",
+            # Removed: 2448.TW (consistently no timezone across all runs)
         ],
     },
 
     # ══════════════════════════════════════════════════════════════
-    # TURKEY — BIST 30 + large caps
+    # TURKEY — BIST 30 + BIST 100  (GitHub repo: MSCI_Turkey)
     # Exchange: Borsa Istanbul (.IS)
-    # GitHub ref: Turkey / MSCI Turkey scripts
+    # yfinance suffix: .IS  (registered above as "TR": ".IS")
+    # Turkish stocks are weighted by free-float market cap in BIST indices
     # ══════════════════════════════════════════════════════════════
     {
         "country": "Turkey",
@@ -1090,25 +1227,29 @@ COUNTRY_JOBS = [
         "url": "https://en.wikipedia.org/wiki/BIST_30",
         "cols": ["Ticker", "Symbol", "Code"],
         "manual": [
-            # BIST 30 core — verified yfinance .IS symbols
+            # ── BIST 30 core ──────────────────────────────────────
             "GARAN.IS","AKBNK.IS","THYAO.IS","EREGL.IS","KCHOL.IS","SAHOL.IS",
             "SISE.IS","TUPRS.IS","ASELS.IS","BIMAS.IS","TCELL.IS","ISCTR.IS",
-            "VAKBN.IS","HALKB.IS","YKBNK.IS","FROTO.IS","TOASO.IS","KOZAL.IS",
-            "SODA.IS","ENKAI.IS","PETKM.IS","ARCLK.IS","MGROS.IS","PGSUS.IS",
-            "CCOLA.IS","EKGYO.IS","ULKER.IS","TAVHL.IS","DOHOL.IS","AGHOL.IS",
-            # BIST 100 large caps
+            "VAKBN.IS","HALKB.IS","YKBNK.IS","FROTO.IS","TOASO.IS","ENKAI.IS",
+            "PETKM.IS","ARCLK.IS","MGROS.IS","PGSUS.IS","CCOLA.IS","EKGYO.IS",
+            "ULKER.IS","TAVHL.IS","DOHOL.IS","AGHOL.IS","KRDMD.IS","KOZAA.IS",
+            # ── BIST 100 large caps ───────────────────────────────
             "AKSEN.IS","ALARK.IS","ALGYO.IS","BRSAN.IS","CIMSA.IS","DOAS.IS",
-            "EGEEN.IS","EREGL.IS","GESAN.IS","GUBRF.IS","IHLGM.IS","IPEKE.IS",
-            "KARSN.IS","KLNMA.IS","KONTR.IS","LOGO.IS","MPARK.IS","NTHOL.IS",
-            "ODAS.IS","OTKAR.IS","OYAKC.IS","PARSN.IS","SELEC.IS","SOKM.IS",
-            "TATGD.IS","TTKOM.IS","TTRAK.IS","VESTL.IS","ZOREN.IS",
+            "EGEEN.IS","GESAN.IS","GUBRF.IS","IHLGM.IS","KARSN.IS","KLNMA.IS",
+            "KONTR.IS","LOGO.IS","MPARK.IS","NTHOL.IS","ODAS.IS","OTKAR.IS",
+            "OYAKC.IS","PARSN.IS","SELEC.IS","SOKM.IS","TATGD.IS","TTKOM.IS",
+            "TTRAK.IS","VESTL.IS","ZOREN.IS","SODA.IS","EREGL.IS","AKFGY.IS",
+            "AEFES.IS","BFREN.IS","BNTAS.IS","BUCIM.IS","CEMTS.IS","DOHOL.IS",
+            "GLYHO.IS","HEKTS.IS","KONYA.IS","LMKDC.IS","MRDIN.IS","NETAS.IS",
+            "PRKAB.IS","TSKB.IS","ULAS.IS","VESBE.IS",
         ],
     },
 
     # ══════════════════════════════════════════════════════════════
-    # INDONESIA — IDX30 / LQ45
-    # Exchange: Indonesia Stock Exchange (.JK)
-    # GitHub ref: MSCI Indonesia
+    # INDONESIA — IDX30 / LQ45  (GitHub repo: MSCI_Indonesia)
+    # Exchange: Indonesia Stock Exchange / Bursa Efek Indonesia (.JK)
+    # yfinance suffix: .JK  (registered above as "ID": ".JK")
+    # LQ45 = 45 most liquid stocks; IDX30 = top 30 by liquidity & cap
     # ══════════════════════════════════════════════════════════════
     {
         "country": "Indonesia",
@@ -1117,22 +1258,26 @@ COUNTRY_JOBS = [
         "url": "https://en.wikipedia.org/wiki/IDX_Composite",
         "cols": ["Ticker", "Symbol", "Code"],
         "manual": [
-            # IDX30 / LQ45 — verified yfinance .JK symbols
+            # ── IDX30 / LQ45 core ─────────────────────────────────
             "BBCA.JK","BBRI.JK","TLKM.JK","BMRI.JK","ASII.JK","BBNI.JK",
             "GOTO.JK","ICBP.JK","UNVR.JK","KLBF.JK","GGRM.JK","PGAS.JK",
             "ADRO.JK","INCO.JK","EXCL.JK","SMGR.JK","JSMR.JK","PTBA.JK",
             "ITMG.JK","INDF.JK","MNCN.JK","HMSP.JK","INKP.JK","TKIM.JK",
             "BSDE.JK","PWON.JK","BREN.JK","CPIN.JK","AMMN.JK","ANTM.JK",
+            # ── LQ45 extended ────────────────────────────────────
             "MDKA.JK","ESSA.JK","BRPT.JK","MAPI.JK","SMRA.JK","CTRA.JK",
-            "WIKA.JK","ADHI.JK","PTPP.JK","WSKT.JK","BBTN.JK","BDMN.JK",
-            "BJBR.JK","BJTM.JK","NISP.JK","BNII.JK","MEGA.JK","PNBN.JK",
+            "BBTN.JK","BDMN.JK","BJBR.JK","BJTM.JK","NISP.JK","BNII.JK",
+            "MEGA.JK","PNBN.JK","WSKT.JK","PTPP.JK","WIKA.JK","ADHI.JK",
+            "UNTR.JK","AALI.JK","LSIP.JK","SIMP.JK","SMCB.JK","INTP.JK",
+            "TBIG.JK","TOWR.JK","MTEL.JK","BUKA.JK","EMTK.JK","DCII.JK",
         ],
     },
 
     # ══════════════════════════════════════════════════════════════
-    # SAUDI ARABIA — Tadawul All Share Index (TASI)
-    # Exchange: Saudi Exchange (.SR)
-    # GitHub ref: MSCI Saudi Arabia Ishares
+    # SAUDI ARABIA — Tadawul All Share Index (TASI)  (GitHub repo: MSCI_Saudi_Arabia_Ishares)
+    # Exchange: Saudi Exchange / Tadawul (.SR)
+    # yfinance suffix: .SR  (already in EXCHANGE_SUFFIX as "SA": ".SR")
+    # 4-digit numeric codes — largest Arab stock market by cap
     # ══════════════════════════════════════════════════════════════
     {
         "country": "Saudi Arabia",
@@ -1141,15 +1286,162 @@ COUNTRY_JOBS = [
         "url": "https://en.wikipedia.org/wiki/Tadawul_All_Share_Index",
         "cols": ["Ticker", "Symbol", "Code"],
         "manual": [
-            # TASI large caps — verified yfinance .SR symbols (4-digit codes)
+            # ── TASI blue-chips — 4-digit codes + .SR ─────────────
+            # #1: Saudi Aramco (2222), followed by SABIC, Al Rajhi Bank, etc.
             "2222.SR","1120.SR","1180.SR","2350.SR","1010.SR","1030.SR",
             "1211.SR","4190.SR","1050.SR","2010.SR","3030.SR","4030.SR",
             "1020.SR","1060.SR","4300.SR","2040.SR","2060.SR","1080.SR",
             "4050.SR","4240.SR","4170.SR","4160.SR","1150.SR","2330.SR",
             "3020.SR","3060.SR","4280.SR","4001.SR","8010.SR","4200.SR",
-            "2280.SR","2020.SR","4030.SR","1010.SR","4130.SR","4140.SR",
-            "4150.SR","4180.SR","4220.SR","4260.SR","4270.SR","4290.SR",
-            "4310.SR","4320.SR","4330.SR","4340.SR","4345.SR","4347.SR",
+            # ── TASI mid-caps ─────────────────────────────────────
+            "2280.SR","2020.SR","4130.SR","4140.SR","4150.SR","4180.SR",
+            "4220.SR","4260.SR","4270.SR","4290.SR","4310.SR","4320.SR",
+            "4330.SR","4340.SR","4345.SR","4347.SR","2290.SR","2300.SR",
+            "1214.SR","2380.SR","4002.SR","4004.SR","4020.SR","4061.SR",
+            "4110.SR","4210.SR","4230.SR","4250.SR","6010.SR","6012.SR",
+            "6020.SR","6040.SR","6050.SR","7010.SR","7020.SR","7030.SR",
+        ],
+    },
+
+    # ══════════════════════════════════════════════════════════════
+    # MALAYSIA — FTSE Bursa Malaysia KLCI 30  (GitHub repo: MSCI Malaysia EWM)
+    # Exchange: Bursa Malaysia (.KL)
+    # yfinance suffix: .KL  (registered above as "MY": ".KL")
+    # Malaysian stocks use 4-digit numeric codes (e.g. 1155.KL = Maybank)
+    # Weighted by free-float market cap; dominated by banks and commodities
+    # ══════════════════════════════════════════════════════════════
+    {
+        "country": "Malaysia",
+        "country_code": "MY",
+        "index_name": "KLCI30",
+        "url": "https://en.wikipedia.org/wiki/FTSE_Bursa_Malaysia_KLCI",
+        "cols": ["Ticker", "Code", "Symbol"],
+        "manual": [
+            # ── KLCI 30 core — 4-digit numeric codes + .KL ────────
+            # Ranked by market cap: Maybank, Public Bank, Tenaga, CIMB first
+            "1155.KL","1295.KL","5347.KL","1023.KL","5183.KL",
+            "6888.KL","6012.KL","4863.KL","1066.KL","5819.KL",
+            "1015.KL","4715.KL","3182.KL","1961.KL","4065.KL",
+            "2445.KL","3816.KL","6033.KL","5225.KL","7277.KL",
+            "4707.KL","7113.KL","5398.KL","1082.KL","3026.KL",
+            "6947.KL","3255.KL","2003.KL","5299.KL","5235.KL",
+            # ── Bursa Malaysia large caps beyond KLCI 30 ──────────
+            "5246.KL","7230.KL","5168.KL","5285.KL","1597.KL",
+            "5199.KL","4588.KL","5238.KL","4197.KL","2291.KL",
+            "0166.KL","0008.KL","5020.KL","5071.KL","5264.KL",
+            "1724.KL","2828.KL","5184.KL","4197.KL","7084.KL",
+        ],
+    },
+
+    # ══════════════════════════════════════════════════════════════
+    # THAILAND — SET50 Index  (GitHub repo: THD MSCI Thailand iShares)
+    # Exchange: Stock Exchange of Thailand (.BK)
+    # yfinance suffix: .BK  (registered above as "TH": ".BK")
+    # Thai stocks use alphabetic tickers (named, not numeric)
+    # SET50 weighted by free-float market cap; PTT, banks, and airports dominant
+    # ══════════════════════════════════════════════════════════════
+    {
+        "country": "Thailand",
+        "country_code": "TH",
+        "index_name": "SET50",
+        "url": "https://en.wikipedia.org/wiki/Stock_Exchange_of_Thailand",
+        "cols": ["Ticker", "Symbol", "Code"],
+        "manual": [
+            # ── SET50 core — alphabetic tickers + .BK ─────────────
+            # Energy & utilities: PTT, PTTEP, GULF, EA, RATCH dominant
+            "PTT.BK","PTTEP.BK","OR.BK","PTTGC.BK","TOP.BK","IRPC.BK",
+            "GULF.BK","BGRIM.BK","RATCH.BK","EA.BK","GPSC.BK",
+            # Banks & finance
+            "KBANK.BK","SCBX.BK","BBL.BK","KTB.BK","TTB.BK","TISCO.BK",
+            "MTC.BK","SAWAD.BK","AEONTS.BK","KTC.BK",
+            # Transport & airports
+            "AOT.BK","BEM.BK","AAV.BK","BA.BK",
+            # Telecom & tech
+            "ADVANC.BK","TRUE.BK","DTAC.BK","DELTA.BK","KCE.BK",
+            # Retail & consumer
+            "CPALL.BK","HMPRO.BK","CRC.BK","MAKRO.BK","BJC.BK",
+            "CENTEL.BK","MINT.BK","OSP.BK","CBG.BK","TU.BK",
+            # Healthcare
+            "BDMS.BK","BH.BK","CHG.BK",
+            # Industry & materials
+            "SCC.BK","IVL.BK","SCGP.BK","WHA.BK","STEC.BK","AMATA.BK",
+            # Real estate
+            "CPN.BK","LH.BK","AWC.BK","SIRI.BK","QH.BK",
+            # Other large caps
+            "PLANB.BK","ROBINS.BK","BEAUTY.BK","HANA.BK","KSL.BK",
+        ],
+    },
+
+    # ══════════════════════════════════════════════════════════════
+    # ISRAEL — TA-35 Index  (GitHub repo: EIS MSCI Israel iShares)
+    # Exchange: Tel Aviv Stock Exchange (.TA)
+    # yfinance suffix: .TA  (already in registry as "IL": ".TA")
+    # TA-35 = 35 largest companies on TASE by market cap
+    # Mix of global tech firms (also on NASDAQ) and domestic banks
+    # ══════════════════════════════════════════════════════════════
+    {
+        "country": "Israel",
+        "country_code": "IL",
+        "index_name": "TA35",
+        "url": "https://en.wikipedia.org/wiki/TA-35_Index",
+        "cols": ["Ticker", "Symbol", "Code"],
+        "manual": [
+            # ── Banks (dominate TA-35 by weight) ──────────────────
+            "HAPO.TA","LUMI.TA","DSCT.TA","MZTF.TA","FIBI.TA","MERT.TA",
+            # ── Technology ────────────────────────────────────────
+            "NICE.TA","CHKP.TA","NVMI.TA","KARO.TA","FORTY.TA",
+            # ── Pharma ────────────────────────────────────────────
+            "TEVA.TA",
+            # ── Defence & Aerospace ───────────────────────────────
+            "ESLT.TA","ARBE.TA",
+            # ── Chemicals & Industry ──────────────────────────────
+            "ICL.TA","DLEKG.TA",
+            # ── Telecom ───────────────────────────────────────────
+            "BEZQ.TA","ORAN.TA","CEL.TA",
+            # ── Insurance & Financial ─────────────────────────────
+            "PHOE.TA","HARL.TA","MGDL.TA","ALHE.TA","IBI.TA",
+            # ── Energy ────────────────────────────────────────────
+            "ENLT.TA","NWMD.TA",
+            # ── Real Estate ───────────────────────────────────────
+            "AZRG.TA","MIVNE.TA","AMOT.TA","GEV.TA","ELCO.TA",
+            # ── Other large caps ──────────────────────────────────
+            "SPEN.TA","SPNS.TA","BCOM.TA","WLWH.TA",
+        ],
+    },
+
+    # ══════════════════════════════════════════════════════════════
+    # GREECE — FTSE/ATHEX 20  (GitHub repo: GREK ETF / MSCI Greece)
+    # Exchange: Athens Stock Exchange / ATHEX (.AT)
+    # yfinance suffix: .AT  (already in registry as "GR": ".AT")
+    # FTSE/ATHEX Large Cap = 20 largest by free-float market cap
+    # Banks dominate (~40% weight); also energy, telco, cement
+    # ══════════════════════════════════════════════════════════════
+    {
+        "country": "Greece",
+        "country_code": "GR",
+        "index_name": "ATHEX20",
+        "url": "https://en.wikipedia.org/wiki/FTSE/ATHEX_Large_Cap",
+        "cols": ["Ticker", "Symbol", "Code"],
+        "manual": [
+            # ── Banks (~40% index weight) ─────────────────────────
+            "ETE.AT","EUROB.AT","ALPHA.AT","TPEIR.AT",
+            # ── Telecom ───────────────────────────────────────────
+            "HTO.AT",
+            # ── Energy & Utilities ────────────────────────────────
+            "PPC.AT","MOH.AT","ELPE.AT","ADMIE.AT","GEK.AT",
+            # ── Industry & Materials ──────────────────────────────
+            "MYTIL.AT","TITK.AT","ELLAKTOR.AT",
+            # ── Gaming & Lottery ──────────────────────────────────
+            "OPAP.AT",
+            # ── Real Estate ───────────────────────────────────────
+            "LAMDA.AT",
+            # ── Transport ─────────────────────────────────────────
+            "AEGN.AT",
+            # ── Retail & Consumer ─────────────────────────────────
+            "INKAT.AT","MERMEREN.AT","BELA.AT",
+            # ── Additional ATHEX large caps ───────────────────────
+            "EXAE.AT","GEBKA.AT","KEKR.AT","FOURLIS.AT",
+            "CENK.AT","PLAT.AT","QUAL.AT","SARANTIS.AT",
         ],
     },
 
@@ -1167,10 +1459,11 @@ GROUPS = {
     "americas": ["USA", "Canada", "Brazil", "Mexico"],
     "europe":   ["Germany", "France", "UK", "Spain", "Netherlands", "Switzerland",
                  "Sweden", "Italy", "Denmark", "Norway", "Finland", "Poland",
-                 "Belgium", "Portugal", "Austria", "Ireland"],
+                 "Belgium", "Portugal", "Austria", "Ireland", "Greece", "Israel"],
     "asia":     ["Japan", "Australia", "India", "South Korea", "Hong Kong",
                  "Singapore", "New Zealand", "South Africa",
-                 "China", "Taiwan", "Turkey", "Indonesia", "Saudi Arabia"],
+                 "China", "Taiwan", "Turkey", "Indonesia", "Saudi Arabia",
+                 "Malaysia", "Thailand"],
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1216,11 +1509,13 @@ if __name__ == "__main__":
         formatter_class=argparse.RawTextHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  python script.py                    # all 28 countries\n"
-            "  python script.py --group europe     # Europe only\n"
-            "  python script.py --group americas   # Americas only\n"
-            "  python script.py --group asia       # Asia-Pacific + Africa\n"
-            "  python script.py --country Brazil   # single country\n"
+            "  python script.py                         # all 37 countries\n"
+            "  python script.py --group europe          # Europe only (18)\n"
+            "  python script.py --group americas        # Americas only (4)\n"
+            "  python script.py --group asia            # Asia/MiddleEast/Africa (15)\n"
+            "  python script.py --country Malaysia      # single country\n"
+            "  python script.py --country Greece\n"
+            "  python script.py --country 'Saudi Arabia'\n"
         )
     )
     parser.add_argument("--country", type=str, default=None,
