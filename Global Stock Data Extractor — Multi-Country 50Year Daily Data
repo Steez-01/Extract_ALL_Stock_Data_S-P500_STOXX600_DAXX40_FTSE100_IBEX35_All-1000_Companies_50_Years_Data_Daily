@@ -137,37 +137,262 @@ def get_suffix(country_code: str) -> str:
 
 GICS_FILE = "GICS_Structure_2026.xlsx"   # expected next to the script
 
-# Loaded once at startup; empty dict if file not found
-_GICS_LOOKUP: dict = {}   # sub_industry_code (int) → dict of 7 columns
+# ── Three forward lookup dicts, all populated by _load_gics_structure() ──────
+_GICS_LOOKUP:         dict = {}  # int(sub_industry_code) → full row dict
+_GICS_BY_INDUSTRY:    dict = {}  # str(industry_name)     → partial row dict (no sub-industry fields)
+_GICS_BY_SECTOR:      dict = {}  # str(sector_name)       → {sector_code, sector} only
+
+# ─── YFINANCE → GICS NAME TRANSLATION MAPS ───────────────────────────────────
+# Root cause: yfinance uses its own industry taxonomy that differs from GICS.
+# e.g. yfinance "Banks - Regional" → GICS Industry "Banks"
+#      yfinance "Marine Shipping"   → GICS Industry "Marine Transportation"
+#      yfinance "Packaged Foods"    → GICS Sub-Industry "Packaged Foods & Meats"
+#                                     (GICS Industry = "Food Products")
+#
+# Without this map, Level-3 (industry text lookup) never fires, leaving
+# Group Code, Industry Group, and Industry Code all blank.
+# With this map, ~90%+ of yfinance industry strings resolve to full GICS codes.
+
+# Sector map: yfinance sector → GICS sector name
+_YF_SECTOR_TO_GICS: dict = {
+    "Technology":             "Information Technology",
+    "Financial Services":     "Financials",
+    "Consumer Cyclical":      "Consumer Discretionary",
+    "Consumer Defensive":     "Consumer Staples",
+    "Healthcare":             "Health Care",
+    "Basic Materials":        "Materials",
+    # exact matches:
+    "Communication Services": "Communication Services",
+    "Real Estate":            "Real Estate",
+    "Energy":                 "Energy",
+    "Utilities":              "Utilities",
+    "Industrials":            "Industrials",
+}
+
+# Industry map: yfinance industry → GICS Industry name (for Level-3 lookup)
+# Built from empirical comparison of all yfinance values vs GICS_Structure_2026.xlsx
+_YF_INDUSTRY_TO_GICS: dict = {
+    # ── Energy ────────────────────────────────────────────────────────────────
+    "Oil & Gas Integrated":              "Oil, Gas & Consumable Fuels",
+    "Oil & Gas E&P":                     "Oil, Gas & Consumable Fuels",
+    "Oil & Gas Midstream":               "Oil, Gas & Consumable Fuels",
+    "Oil & Gas Refining & Marketing":    "Oil, Gas & Consumable Fuels",
+    "Oil & Gas Drilling":                "Energy Equipment & Services",
+    "Oil & Gas Equipment & Services":    "Energy Equipment & Services",
+    "Thermal Coal":                      "Oil, Gas & Consumable Fuels",
+    "Coking Coal":                       "Oil, Gas & Consumable Fuels",
+    "Uranium":                           "Oil, Gas & Consumable Fuels",
+    "Solar":                             "Oil, Gas & Consumable Fuels",
+    # ── Materials ─────────────────────────────────────────────────────────────
+    "Specialty Chemicals":               "Chemicals",
+    "Agricultural Inputs":               "Chemicals",
+    "Aluminum":                          "Metals & Mining",
+    "Copper":                            "Metals & Mining",
+    "Gold":                              "Metals & Mining",
+    "Silver":                            "Metals & Mining",
+    "Other Precious Metals & Mining":    "Metals & Mining",
+    "Other Industrial Metals & Mining":  "Metals & Mining",
+    "Steel":                             "Metals & Mining",
+    "Building Materials":                "Construction Materials",
+    "Paper & Paper Products":            "Paper & Forest Products",
+    "Lumber & Wood Production":          "Paper & Forest Products",
+    "Packaging & Containers":            "Containers & Packaging",
+    # ── Industrials ───────────────────────────────────────────────────────────
+    "Aerospace & Defense":               "Aerospace & Defense",
+    "Airlines":                          "Passenger Airlines",
+    "Airports & Air Services":           "Transportation Infrastructure",
+    "Auto & Truck Dealerships":          "Trading Companies & Distributors",
+    "Building Products & Equipment":     "Building Products",
+    "Consulting Services":               "Professional Services",
+    "Education & Training Services":     "Diversified Consumer Services",
+    "Farm & Heavy Construction Machinery": "Machinery",
+    "Industrial Distribution":           "Trading Companies & Distributors",
+    "Industrial Machinery":              "Machinery",
+    "Specialty Industrial Machinery":    "Machinery",
+    "Tools & Accessories":               "Machinery",
+    "Metal Fabrication":                 "Metals & Mining",
+    "Conglomerates":                     "Industrial Conglomerates",
+    "Engineering & Construction":        "Construction & Engineering",
+    "Infrastructure Operations":         "Transportation Infrastructure",
+    "Integrated Freight & Logistics":    "Air Freight & Logistics",
+    "Marine Shipping":                   "Marine Transportation",
+    "Railroads":                         "Ground Transportation",
+    "Trucking":                          "Ground Transportation",
+    "Waste Management":                  "Commercial Services & Supplies",
+    "Electrical Equipment & Parts":      "Electrical Equipment",
+    "Pollution & Treatment Controls":    "Commercial Services & Supplies",
+    "Rental & Leasing Services":         "Commercial Services & Supplies",
+    "Personal Services":                 "Commercial Services & Supplies",
+    "Specialty Business Services":       "Professional Services",
+    "Security & Protection Services":    "Commercial Services & Supplies",
+    "Staffing & Employment Services":    "Professional Services",
+    "Research & Consulting Services":    "Professional Services",
+    "Business Equipment & Supplies":     "Commercial Services & Supplies",
+    # ── Consumer Discretionary ────────────────────────────────────────────────
+    "Auto Manufacturers":                "Automobiles",
+    "Auto Parts":                        "Automobile Components",
+    "Auto & Truck Dealerships":          "Specialty Retail",
+    "Apparel Retail":                    "Specialty Retail",
+    "Discount Stores":                   "Broadline Retail",
+    "Leisure":                           "Leisure Products",
+    "Recreational Vehicles":             "Leisure Products",
+    "Luxury Goods":                      "Textiles, Apparel & Luxury Goods",
+    "Apparel Manufacturing":             "Textiles, Apparel & Luxury Goods",
+    "Textile Manufacturing":             "Textiles, Apparel & Luxury Goods",
+    "Footwear & Accessories":            "Textiles, Apparel & Luxury Goods",
+    "Residential Construction":          "Household Durables",
+    "Furnishings Fixtures & Appliances": "Household Durables",
+    "Furnishings, Fixtures & Appliances":"Household Durables",
+    "Consumer Electronics":              "Household Durables",
+    "Gambling":                          "Hotels, Restaurants & Leisure",
+    "Resorts & Casinos":                 "Hotels, Restaurants & Leisure",
+    "Restaurants":                       "Hotels, Restaurants & Leisure",
+    "Travel Services":                   "Hotels, Restaurants & Leisure",
+    "Lodging":                           "Hotels, Restaurants & Leisure",
+    "Internet Retail":                   "Broadline Retail",
+    "Specialty Retail":                  "Specialty Retail",
+    "Department Stores":                 "Broadline Retail",
+    "Home Improvement Retail":           "Specialty Retail",
+    # ── Consumer Staples ──────────────────────────────────────────────────────
+    "Beverages - Brewers":               "Beverages",
+    "Beverages - Non-Alcoholic":         "Beverages",
+    "Beverages - Wineries & Distilleries": "Beverages",
+    "Farm Products":                     "Food Products",
+    "Food Distribution":                 "Consumer Staples Distribution & Retail",
+    "Grocery Stores":                    "Consumer Staples Distribution & Retail",
+    "Pharmaceutical Retailers":          "Consumer Staples Distribution & Retail",
+    "Packaged Foods":                    "Food Products",
+    "Confectioners":                     "Food Products",
+    "Tobacco":                           "Tobacco",
+    "Household & Personal Products":     "Household Products",
+    "Personal Products":                 "Personal Care Products",
+    # ── Health Care ───────────────────────────────────────────────────────────
+    "Biotechnology":                     "Biotechnology",
+    "Drug Manufacturers - General":      "Pharmaceuticals",
+    "Drug Manufacturers - Specialty & Generic": "Pharmaceuticals",
+    "Medical Care Facilities":           "Health Care Providers & Services",
+    "Medical Devices":                   "Health Care Equipment & Supplies",
+    "Medical Distribution":              "Health Care Providers & Services",
+    "Medical Instruments & Supplies":    "Health Care Equipment & Supplies",
+    "Diagnostics & Research":            "Life Sciences Tools & Services",
+    "Health Information Services":       "Health Care Technology",
+    # ── Financials ────────────────────────────────────────────────────────────
+    "Banks - Diversified":               "Banks",
+    "Banks - Regional":                  "Banks",
+    "Asset Management":                  "Capital Markets",
+    "Capital Markets":                   "Capital Markets",
+    "Credit Services":                   "Consumer Finance",
+    "Financial Data & Stock Exchanges":  "Financial Services",
+    "Financial Conglomerates":           "Financial Services",
+    "Insurance - Diversified":           "Insurance",
+    "Insurance - Life":                  "Insurance",
+    "Insurance - Property & Casualty":   "Insurance",
+    "Insurance - Reinsurance":           "Insurance",
+    "Insurance - Specialty":             "Insurance",
+    "Insurance Brokers":                 "Insurance",
+    "Healthcare Plans":                  "Health Care Providers & Services",
+    "Mortgage Finance":                  "Financial Services",
+    # ── Information Technology ────────────────────────────────────────────────
+    "Computer Hardware":                 "Technology Hardware, Storage & Peripherals",
+    "Consumer Electronics":              "Technology Hardware, Storage & Peripherals",
+    "Electronic Components":             "Electronic Equipment, Instruments & Components",
+    "Electronics & Computer Distribution": "Electronic Equipment, Instruments & Components",
+    "Information Technology Services":   "IT Services",
+    "Internet Content & Information":    "Interactive Media & Services",
+    "Semiconductor Equipment & Materials": "Semiconductors & Semiconductor Equipment",
+    "Semiconductors":                    "Semiconductors & Semiconductor Equipment",
+    "Software - Application":            "Software",
+    "Software - Infrastructure":         "Software",
+    "Scientific & Technical Instruments": "Electronic Equipment, Instruments & Components",
+    # ── Communication Services ────────────────────────────────────────────────
+    "Advertising Agencies":              "Media",
+    "Broadcasting":                      "Media",
+    "Electronic Gaming & Multimedia":    "Interactive Media & Services",
+    "Entertainment":                     "Entertainment",
+    "Internet Content & Information":    "Interactive Media & Services",
+    "Publishing":                        "Media",
+    "Telecom Services":                  "Telecommunication Services",
+    "Wireless Telecom Services":         "Telecommunication Services",
+    "Communication Equipment":           "Communications Equipment",
+    # ── Utilities ─────────────────────────────────────────────────────────────
+    "Utilities - Diversified":           "Multi-Utilities",
+    "Utilities - Independent Power Producers": "Independent Power and Renewable Electricity Producers",
+    "Utilities - Regulated Electric":    "Electric Utilities",
+    "Utilities - Regulated Gas":         "Gas Utilities",
+    "Utilities - Regulated Water":       "Water Utilities",
+    "Utilities - Renewable":             "Independent Power and Renewable Electricity Producers",
+    # ── Real Estate ───────────────────────────────────────────────────────────
+    "Real Estate - Development":         "Real Estate Management & Development",
+    "Real Estate - Diversified":         "Real Estate Management & Development",
+    "Real Estate Services":              "Real Estate Management & Development",
+    "REIT - Diversified":                "Equity Real Estate Investment Trusts (REITs)",
+    "REIT - Industrial":                 "Equity Real Estate Investment Trusts (REITs)",
+    "REIT - Office":                     "Equity Real Estate Investment Trusts (REITs)",
+    "REIT - Residential":                "Equity Real Estate Investment Trusts (REITs)",
+    "REIT - Retail":                     "Equity Real Estate Investment Trusts (REITs)",
+    "REIT - Specialty":                  "Equity Real Estate Investment Trusts (REITs)",
+    "REIT - Healthcare Facilities":      "Equity Real Estate Investment Trusts (REITs)",
+    "REIT - Hotel & Motel":              "Equity Real Estate Investment Trusts (REITs)",
+    "REIT - Mortgage":                   "Mortgage Real Estate Investment Trusts (REITs)",
+}
 
 def _load_gics_structure() -> dict:
-    """Build a lookup dict from the GICS structure xlsx.
-    Key = sub-industry code (int, 8-digit).
-    Value = dict with keys matching the 7 GICS column names.
+    """Build three lookup dicts from the GICS structure xlsx.
+
+    Primary (existing): sub_industry_code (int, 8-digit) → full 7-column dict
+    New – reverse by industry name: industry str → sector/group/industry codes dict
+    New – reverse by sector name:   sector str  → {sector_code, sector} dict
+
+    The reverse lookups power the new fallback chain in get_ticker_meta():
+    when yfinance doesn't provide gicsSubIndustryCode but does provide sector
+    and/or industry strings, we can auto-fill the codes from the xlsx.
     """
+    global _GICS_BY_INDUSTRY, _GICS_BY_SECTOR
+
     if not os.path.exists(GICS_FILE):
         log.warning(f"   GICS file '{GICS_FILE}' not found — GICS columns will be blank.")
         return {}
     try:
         import pandas as _pd
         df = _pd.read_excel(GICS_FILE)
-        # Expected columns (from GICS_Structure_2026.xlsx):
-        # Sector Code | Sector | Group Code | Industry Group |
-        # Industry Code | Industry | Sub-Industry Code | Sub-Industry
         lookup = {}
         for _, row in df.iterrows():
-            key = int(row["Sub-Industry Code"])
-            lookup[key] = {
-                "sector_code":      int(row["Sector Code"]),
-                "sector":           str(row["Sector"]),
-                "group_code":       int(row["Group Code"]),
-                "industry_group":   str(row["Industry Group"]),
-                "industry_code":    int(row["Industry Code"]),
-                "industry":         str(row["Industry"]),
-                "sub_industry_code":key,
-                "sub_industry":     str(row["Sub-Industry"]),
+            sub_key = int(row["Sub-Industry Code"])
+            entry = {
+                "sector_code":       int(row["Sector Code"]),
+                "sector":            str(row["Sector"]),
+                "group_code":        int(row["Group Code"]),
+                "industry_group":    str(row["Industry Group"]),
+                "industry_code":     int(row["Industry Code"]),
+                "industry":          str(row["Industry"]),
+                "sub_industry_code": sub_key,
+                "sub_industry":      str(row["Sub-Industry"]),
             }
-        log.info(f"   GICS structure loaded: {len(lookup)} sub-industries")
+            lookup[sub_key] = entry
+
+            # Reverse lookup: industry name → codes (first occurrence wins; confirmed
+            # that every GICS industry name maps to exactly one set of codes)
+            ind_name = str(row["Industry"])
+            if ind_name not in _GICS_BY_INDUSTRY:
+                _GICS_BY_INDUSTRY[ind_name] = {
+                    "sector_code":    int(row["Sector Code"]),
+                    "sector":         str(row["Sector"]),
+                    "group_code":     int(row["Group Code"]),
+                    "industry_group": str(row["Industry Group"]),
+                    "industry_code":  int(row["Industry Code"]),
+                    "industry":       ind_name,
+                }
+
+            # Reverse lookup: sector name → codes (first occurrence wins)
+            sec_name = str(row["Sector"])
+            if sec_name not in _GICS_BY_SECTOR:
+                _GICS_BY_SECTOR[sec_name] = {
+                    "sector_code": int(row["Sector Code"]),
+                    "sector":      sec_name,
+                }
+
+        log.info(f"   GICS structure loaded: {len(lookup)} sub-industries | "
+                 f"{len(_GICS_BY_INDUSTRY)} industries | {len(_GICS_BY_SECTOR)} sectors")
         return lookup
     except Exception as e:
         log.warning(f"   GICS structure load failed: {e} — GICS columns will be blank.")
@@ -179,15 +404,19 @@ _TICKER_META_CACHE: dict = {}   # ticker → {"name": str, gics fields...}
 def get_ticker_meta(ticker: str) -> dict:
     """Return GICS metadata dict for a ticker.
 
-    Always returns a dict with all 9 keys; values may be empty strings
-    if yfinance or the GICS lookup has no data for this ticker.
+    Resolution order (stops at first successful match):
+      1. gicsSubIndustryCode (8-digit int)  → full hierarchy via _GICS_LOOKUP
+      2. sub-industry text match            → full hierarchy via _GICS_LOOKUP
+      3. industry text match                → sector/group/industry codes via _GICS_BY_INDUSTRY
+         (sub-industry fields left blank; the industry IS filled in)
+      4. sector text match (with yfinance→GICS name translation)
+         → sector code + sector name only
 
-    Called once per ticker per country run; results are memoised in
-    _TICKER_META_CACHE for the lifetime of the process.
+    Always returns a dict with all 9 keys; missing fields are empty strings.
+    Results are memoised in _TICKER_META_CACHE for the process lifetime.
     """
-    global _GICS_LOOKUP, _TICKER_META_CACHE
+    global _GICS_LOOKUP, _GICS_BY_INDUSTRY, _GICS_BY_SECTOR, _TICKER_META_CACHE
 
-    # Lazy-load GICS structure on first call
     if not _GICS_LOOKUP:
         _GICS_LOOKUP = _load_gics_structure()
 
@@ -208,15 +437,12 @@ def get_ticker_meta(ticker: str) -> dict:
 
     try:
         info = yf.Ticker(ticker).info
-        # Company name
         meta["name"] = info.get("longName") or info.get("shortName") or ""
 
-        # yfinance exposes the 8-digit GICS sub-industry code as 'gicsSubIndustryCode'
-        # or we can fall back to building it from 'sector' alone if code absent.
-        # The most reliable field is 'gicsSubIndustryCode' (newer yfinance versions).
-        sub_code_raw = info.get("gicsSubIndustryCode") or info.get("industryKey") or None
+        resolved = False
 
-        # Try to parse as integer
+        # ── Level 1: 8-digit GICS sub-industry code ──────────────────────────
+        sub_code_raw = info.get("gicsSubIndustryCode") or None
         sub_code = None
         if sub_code_raw is not None:
             try:
@@ -224,7 +450,6 @@ def get_ticker_meta(ticker: str) -> dict:
             except (ValueError, TypeError):
                 pass
 
-        # If we have the 8-digit code, do a full hierarchy lookup
         if sub_code and sub_code in _GICS_LOOKUP:
             gics = _GICS_LOOKUP[sub_code]
             meta.update({
@@ -237,17 +462,61 @@ def get_ticker_meta(ticker: str) -> dict:
                 "sub_industry_code": str(gics["sub_industry_code"]),
                 "sub_industry":      gics["sub_industry"],
             })
-        else:
-            # Fallback: fill only what yfinance gives us directly
-            meta["sector"] = info.get("sector") or ""
-            meta["industry"] = info.get("industry") or ""
+            resolved = True
+
+        # ── Level 2: sub-industry TEXT from yfinance → reverse lookup ─────────
+        if not resolved:
+            sub_ind_text = info.get("industryDisp") or info.get("industry") or ""
+            if sub_ind_text and sub_ind_text in _GICS_LOOKUP.get("_by_sub_industry", {}):
+                # (reserved for future: currently sub-industry text lookup not built)
+                pass
+
+        # ── Level 3: industry TEXT → auto-fill sector/group/industry codes ────
+        # yfinance industry strings rarely match GICS industry names directly.
+        # We first apply the translation map, then do a direct lookup.
+        # e.g. "Banks - Regional" → "Banks" → {sector_code:40, group_code:4010, ...}
+        if not resolved and _GICS_BY_INDUSTRY:
+            yf_industry = info.get("industry") or ""
+            # Translate yfinance industry name → GICS industry name
+            gics_industry_name = _YF_INDUSTRY_TO_GICS.get(yf_industry, yf_industry)
+            if gics_industry_name and gics_industry_name in _GICS_BY_INDUSTRY:
+                gics_ind = _GICS_BY_INDUSTRY[gics_industry_name]
+                meta.update({
+                    "sector_code":    str(gics_ind["sector_code"]),
+                    "sector":         gics_ind["sector"],
+                    "group_code":     str(gics_ind["group_code"]),
+                    "industry_group": gics_ind["industry_group"],
+                    "industry_code":  str(gics_ind["industry_code"]),
+                    "industry":       gics_ind["industry"],
+                    # sub_industry fields stay blank — known Industry, not Sub-Industry
+                })
+                resolved = True
+                log.debug(f"   GICS Level-3 for {ticker}: '{yf_industry}' → '{gics_industry_name}'")
+
+        # ── Level 4: sector TEXT → fill sector code only ─────────────────────
+        # Last resort: at least fill in the sector code + name.
+        # yfinance sector names differ from GICS (e.g. "Technology" vs
+        # "Information Technology"), so we apply the translation map first.
+        if not resolved and _GICS_BY_SECTOR:
+            yf_sector = info.get("sector") or ""
+            # Translate yfinance sector name → GICS sector name
+            gics_sector_name = _YF_SECTOR_TO_GICS.get(yf_sector, yf_sector)
+            if gics_sector_name and gics_sector_name in _GICS_BY_SECTOR:
+                gics_sec = _GICS_BY_SECTOR[gics_sector_name]
+                meta.update({
+                    "sector_code": str(gics_sec["sector_code"]),
+                    "sector":      gics_sec["sector"],
+                })
+                # Also store the raw industry text even if no code match
+                meta["industry"] = info.get("industry") or ""
+                log.debug(f"   GICS Level-4 match for {ticker}: sector='{yf_sector}'"
+                          f" → '{gics_sector_name}'")
 
     except Exception as e:
         log.debug(f"   GICS meta fetch failed for {ticker}: {e}")
 
     _TICKER_META_CACHE[ticker] = meta
     return meta
-
 
 
 def load_cache() -> dict:
