@@ -703,15 +703,16 @@ def flush_earnings_cache():
             json.dump(_EARNINGS_CACHE, f, indent=2, sort_keys=True)
 
 def get_ticker_earnings(ticker: str) -> dict:
-    """Return last-reported earnings data for a ticker, using persistent cache.
+    """Return last-reported earnings data + market cap + shares for a ticker.
 
     Resolution order:
       1. earnings_dates  → Reported EPS + last/next earnings dates
       2. quarterly_income_stmt (or quarterly_financials) → Revenue + Net Income (Q)
       3. income_stmt (or financials) → Revenue + Net Income (A)
+      4. fast_info → Market Cap + Shares Outstanding (live, from the same session)
 
     Cache key:   ticker
-    Cache value: all 6 fields + "last_fetched" date string
+    Cache value: all 8 fields + "last_fetched" date string
     TTL:         EARNINGS_CACHE_TTL_DAYS (30 days)
     Skips re-fetch if entry exists and is within TTL, regardless of whether the
     values are blank (blank = confirmed yfinance has no data for this ticker).
@@ -726,6 +727,8 @@ def get_ticker_earnings(ticker: str) -> dict:
         "last_earnings_date":  "",
         "next_earnings_date":  "",
         "period_type":         "",
+        "market_cap":          "",
+        "shares_outstanding":  "",
     }
 
     # ── Cache hit: return immediately if entry is fresh ───────────────────────
@@ -820,6 +823,40 @@ def get_ticker_earnings(ticker: str) -> dict:
                 stmt = getattr(tkr, attr, None)
                 if _parse_income_stmt(stmt, label):
                     fetched_financials = True
+            except Exception:
+                pass
+
+        # 3. Market Cap + Shares Outstanding via fast_info (lightweight, no extra call)
+        # fast_info is already used during ranking; calling it here is cheap because
+        # yfinance reuses the session for the same ticker within the same process.
+        # We try fast_info first (faster), then fall back to .info for shares.
+        try:
+            fi = tkr.fast_info
+            mc = getattr(fi, "market_cap", None)
+            if mc and isinstance(mc, (int, float)) and mc > 0:
+                result["market_cap"] = int(mc)
+            # Shares: fast_info exposes 'shares' on newer yfinance builds
+            sh = getattr(fi, "shares", None)
+            if sh and isinstance(sh, (int, float)) and sh > 0:
+                result["shares_outstanding"] = int(sh)
+        except Exception:
+            pass
+
+        # Fallback: .info for shares_outstanding if fast_info had nothing
+        if not result["shares_outstanding"]:
+            try:
+                info = tkr.info
+                for key in ("sharesOutstanding", "impliedSharesOutstanding",
+                            "floatShares"):
+                    val = info.get(key)
+                    if val and isinstance(val, (int, float)) and val > 0:
+                        result["shares_outstanding"] = int(val)
+                        break
+                # Also try market cap from info if fast_info missed it
+                if not result["market_cap"]:
+                    mc = info.get("marketCap")
+                    if mc and isinstance(mc, (int, float)) and mc > 0:
+                        result["market_cap"] = int(mc)
             except Exception:
                 pass
 
@@ -1209,30 +1246,36 @@ def extract_country_data(job: dict):
 
     # ── Earnings data (cols B2–B7, inserted right after company name) ─────────
     # Column layout after this addition:
-    #   A  Ticker                (row index)
+    #   A  Ticker                  (row index)
     #   B  Full name Ticker Symbol
-    #   C  Last EPS              ← NEW: most recent reported EPS
-    #   D  Last Revenue          ← NEW: most recent total revenue (local currency)
-    #   E  Last Net Income       ← NEW: most recent net income (local currency)
-    #   F  Last Earnings Date    ← NEW: period-end date of most recent report
-    #   G  Next Earnings Date    ← NEW: next expected report date (if available)
-    #   H  Period Type           ← NEW: Q=quarterly, A=annual
-    #   I  Sector Code           (was B)
-    #   J  Sector                (was C)
-    #   K  Group Code            (was D)
-    #   L  Industry Group        (was E)
-    #   M  Industry Code         (was F)
-    #   N  Industry              (was G)
-    #   O  Sub-Industry Code     (was H)
-    #   P  Sub-Industry          (was I)
-    #   Q… daily close prices    (unchanged)
+    #   C  Market Cap              ← NEW: live market capitalisation (local currency)
+    #   D  Shares Outstanding      ← NEW: total shares outstanding
+    #   E  Last EPS                ← earnings: most recent reported EPS
+    #   F  Last Revenue            ← earnings: most recent total revenue (local currency)
+    #   G  Last Net Income         ← earnings: most recent net income (local currency)
+    #   H  Last Earnings Date      ← earnings: period-end date of most recent report
+    #   I  Next Earnings Date      ← earnings: next expected report date (if available)
+    #   J  Period Type             ← earnings: Q=quarterly, A=annual
+    #   K  Sector Code             (GICS 2-digit)
+    #   L  Sector
+    #   M  Group Code              (GICS 4-digit)
+    #   N  Industry Group
+    #   O  Industry Code           (GICS 6-digit)
+    #   P  Industry
+    #   Q  Sub-Industry Code       (GICS 8-digit)
+    #   R  Sub-Industry
+    #   S… daily close prices      (unchanged)
     log.info(f"   Fetching earnings data for {len(available)} tickers "
              f"(cached results skip API call)...")
     earnings_rows = []
     earnings_hits = 0
+    mcap_hits     = 0
+    shares_hits   = 0
     for t in available:
         e = get_ticker_earnings(t)
         earnings_rows.append({
+            "Market Cap":         e["market_cap"],
+            "Shares Outstanding": e["shares_outstanding"],
             "Last EPS":           e["last_eps"],
             "Last Revenue":       e["last_revenue"],
             "Last Net Income":    e["last_net_income"],
@@ -1242,7 +1285,13 @@ def extract_country_data(job: dict):
         })
         if e["last_eps"] or e["last_revenue"] or e["last_net_income"]:
             earnings_hits += 1
-    log.info(f"   Earnings: {earnings_hits}/{len(available)} tickers have data")
+        if e["market_cap"]:
+            mcap_hits += 1
+        if e["shares_outstanding"]:
+            shares_hits += 1
+    log.info(f"   Earnings: {earnings_hits}/{len(available)} have data | "
+             f"Market Cap: {mcap_hits}/{len(available)} | "
+             f"Shares: {shares_hits}/{len(available)}")
 
     # Persist earnings cache to disk after processing this country
     flush_earnings_cache()
@@ -1250,17 +1299,17 @@ def extract_country_data(job: dict):
     earnings_df = pd.DataFrame(earnings_rows, index=available)
 
     # Assemble final output — preserve strict column ordering:
-    # [Full Name | 6 Earnings cols | 8 GICS cols | price date cols]
+    # [Full Name | Market Cap | Shares | 6 Earnings cols | 8 GICS cols | price date cols]
     name_col  = meta_df[["Full name Ticker Symbol"]]
     gics_cols = meta_df.drop(columns=["Full name Ticker Symbol"])
     df_out    = pd.concat([name_col, earnings_df, gics_cols, df_wide], axis=1)
 
     filename = os.path.join(OUTPUT_DIR, f"{country}_{index_name}_{len(available)}_tickers.csv")
     df_out.to_csv(filename, index_label="Ticker")
-    n_meta = 9 + 6  # 9 GICS cols + 6 earnings cols
+    n_meta = 9 + 8  # 9 GICS cols + 8 meta cols (2 market + 6 earnings)
     log.info(f"   ✓ Saved: {filename}  "
              f"({df_out.shape[0]} tickers × {df_out.shape[1]-n_meta} days "
-             f"+ {n_meta} meta cols [{earnings_hits} with earnings])")
+             f"+ {n_meta} meta cols [{mcap_hits} with market cap | {earnings_hits} with earnings])")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # COUNTRY JOB LIBRARY — COMPLETE MANUAL TICKER LISTS
