@@ -595,6 +595,10 @@ def load_retired_set() -> set:
 FAIL_COUNTS_FILE = "failure_counts.json"
 FAIL_THRESHOLD   = 3   # consecutive failures before auto-retire
 
+# ─── EARNINGS CACHE SETTINGS ──────────────────────────────────────────────────
+EARNINGS_CACHE_FILE    = "earnings_cache.json"
+EARNINGS_CACHE_TTL_DAYS = 30  # Re-fetch if entry is older than 30 days
+
 def load_fail_counts() -> dict:
     if os.path.exists(FAIL_COUNTS_FILE):
         with open(FAIL_COUNTS_FILE, "r") as f:
@@ -659,6 +663,172 @@ def clean_fail_counts_for_retired():
         save_fail_counts(counts)
         log.info(f"   Fix C: cleaned {before - len(counts)} already-retired entries "
                  f"from failure_counts.json")
+
+# ─── EARNINGS DATA EXTRACTION ─────────────────────────────────────────────────
+# Fetches last reported earnings per ticker using yfinance.
+# Stored as 6 new columns inserted immediately after "Full name Ticker Symbol":
+#   Last EPS           – most recent reported earnings per share
+#   Last Revenue       – most recent total revenue (absolute, local currency)
+#   Last Net Income    – most recent net income (absolute, local currency)
+#   Last Earnings Date – period end date of the most recent report
+#   Next Earnings Date – next expected earnings date (if Yahoo has it)
+#   Period Type        – "Q" (quarterly), "A" (annual), "H" (semi-annual)
+#
+# Caching: earnings_cache.json persists results across runs.
+# A cached entry is reused for EARNINGS_CACHE_TTL_DAYS (default 30) days.
+# This prevents redundant API calls — once a quarter/annual result is stored,
+# it is not re-fetched until the TTL expires or a newer reporting date is detected.
+#
+# Coverage reality (based on yfinance availability):
+#   Excellent (Q+A): USA, Canada, UK, Germany, France, Australia, India
+#   Good (A+some Q): Japan, South Korea, Hong Kong, Brazil
+#   Moderate (A):    Mexico, Argentina, Eastern Europe, SE Asia
+#   Weak/blank:      Czech small caps, Hungarian small caps, some EM tickers
+
+_EARNINGS_CACHE: dict = {}    # in-memory mirror of earnings_cache.json
+_EARNINGS_CACHE_LOADED = False
+
+def _ensure_earnings_cache_loaded():
+    global _EARNINGS_CACHE, _EARNINGS_CACHE_LOADED
+    if not _EARNINGS_CACHE_LOADED:
+        if os.path.exists(EARNINGS_CACHE_FILE):
+            with open(EARNINGS_CACHE_FILE, "r") as f:
+                _EARNINGS_CACHE = json.load(f)
+        _EARNINGS_CACHE_LOADED = True
+
+def flush_earnings_cache():
+    """Write the in-memory earnings cache to disk.  Call once per country run."""
+    if _EARNINGS_CACHE:
+        with open(EARNINGS_CACHE_FILE, "w") as f:
+            json.dump(_EARNINGS_CACHE, f, indent=2, sort_keys=True)
+
+def get_ticker_earnings(ticker: str) -> dict:
+    """Return last-reported earnings data for a ticker, using persistent cache.
+
+    Resolution order:
+      1. earnings_dates  → Reported EPS + last/next earnings dates
+      2. quarterly_income_stmt (or quarterly_financials) → Revenue + Net Income (Q)
+      3. income_stmt (or financials) → Revenue + Net Income (A)
+
+    Cache key:   ticker
+    Cache value: all 6 fields + "last_fetched" date string
+    TTL:         EARNINGS_CACHE_TTL_DAYS (30 days)
+    Skips re-fetch if entry exists and is within TTL, regardless of whether the
+    values are blank (blank = confirmed yfinance has no data for this ticker).
+    """
+    _ensure_earnings_cache_loaded()
+    today = datetime.today().strftime("%Y-%m-%d")
+
+    _empty = {
+        "last_eps":            "",
+        "last_revenue":        "",
+        "last_net_income":     "",
+        "last_earnings_date":  "",
+        "next_earnings_date":  "",
+        "period_type":         "",
+    }
+
+    # ── Cache hit: return immediately if entry is fresh ───────────────────────
+    if ticker in _EARNINGS_CACHE:
+        entry     = _EARNINGS_CACHE[ticker]
+        fetched   = entry.get("last_fetched", "2000-01-01")
+        age_days  = (datetime.today() - datetime.strptime(fetched, "%Y-%m-%d")).days
+        if age_days < EARNINGS_CACHE_TTL_DAYS:
+            return {k: entry.get(k, "") for k in _empty}
+
+    # ── Fresh fetch ───────────────────────────────────────────────────────────
+    result = dict(_empty)
+    try:
+        tkr = yf.Ticker(ticker)
+
+        # 1. earnings_dates: Reported EPS + next/last dates
+        try:
+            ed = tkr.earnings_dates
+            if ed is not None and not ed.empty:
+                # Identify the "Reported EPS" column (name varies by yfinance version)
+                eps_col = next((c for c in ed.columns if "Reported" in str(c)), None)
+                if eps_col:
+                    past   = ed[ed[eps_col].notna()]
+                    future = ed[ed[eps_col].isna()]
+                    if not past.empty:
+                        latest = past.iloc[0]
+                        raw_eps = latest[eps_col]
+                        if pd.notna(raw_eps):
+                            result["last_eps"] = round(float(raw_eps), 4)
+                        d = past.index[0]
+                        result["last_earnings_date"] = str(
+                            d.date() if hasattr(d, "date") else d)
+                    if not future.empty:
+                        d = future.index[-1]
+                        result["next_earnings_date"] = str(
+                            d.date() if hasattr(d, "date") else d)
+        except Exception:
+            pass
+
+        # Helper: extract Revenue + Net Income from an income statement DataFrame
+        def _parse_income_stmt(stmt, period_label: str) -> bool:
+            if stmt is None or (hasattr(stmt, "empty") and stmt.empty):
+                return False
+            try:
+                col = stmt.columns[0]   # most recent period
+                # Revenue — try several possible row names
+                rev_val = None
+                for rname in ("Total Revenue", "TotalRevenue",
+                              "Revenue", "Net Revenue", "Sales"):
+                    if rname in stmt.index:
+                        v = stmt.loc[rname, col]
+                        if pd.notna(v):
+                            rev_val = int(v)
+                            break
+                # Net Income
+                ni_val = None
+                for rname in ("Net Income", "NetIncome",
+                              "Net Income Common Stockholders",
+                              "Net Income From Continuing Operations"):
+                    if rname in stmt.index:
+                        v = stmt.loc[rname, col]
+                        if pd.notna(v):
+                            ni_val = int(v)
+                            break
+                if rev_val is None and ni_val is None:
+                    return False
+                if rev_val is not None:
+                    result["last_revenue"]    = rev_val
+                if ni_val is not None:
+                    result["last_net_income"] = ni_val
+                result["period_type"] = period_label
+                # Fill date from statement column if earnings_dates didn't supply it
+                if not result["last_earnings_date"]:
+                    d = col
+                    result["last_earnings_date"] = str(
+                        d.date() if hasattr(d, "date") else d)
+                return True
+            except Exception:
+                return False
+
+        # 2. Quarterly first (preferred), then annual fallback
+        fetched_financials = False
+        for attr, label in [
+            ("quarterly_income_stmt", "Q"),
+            ("quarterly_financials",  "Q"),
+            ("income_stmt",           "A"),
+            ("financials",            "A"),
+        ]:
+            if fetched_financials:
+                break
+            try:
+                stmt = getattr(tkr, attr, None)
+                if _parse_income_stmt(stmt, label):
+                    fetched_financials = True
+            except Exception:
+                pass
+
+    except Exception as e:
+        log.debug(f"   Earnings fetch failed for {ticker}: {e}")
+
+    # Store in cache (even if all fields blank — avoids repeated failed calls)
+    _EARNINGS_CACHE[ticker] = {**result, "last_fetched": today}
+    return result
 
 def clean_double_suffix_from_cache():
     """Remove malformed tickers from every bucket in the cache file.
@@ -1036,12 +1206,61 @@ def extract_country_data(job: dict):
         })
 
     meta_df = pd.DataFrame(meta_rows, index=available)
-    # Combine: meta (A–I) | price dates (K onwards); ticker stays as the row index (J)
-    df_out = pd.concat([meta_df, df_wide], axis=1)
+
+    # ── Earnings data (cols B2–B7, inserted right after company name) ─────────
+    # Column layout after this addition:
+    #   A  Ticker                (row index)
+    #   B  Full name Ticker Symbol
+    #   C  Last EPS              ← NEW: most recent reported EPS
+    #   D  Last Revenue          ← NEW: most recent total revenue (local currency)
+    #   E  Last Net Income       ← NEW: most recent net income (local currency)
+    #   F  Last Earnings Date    ← NEW: period-end date of most recent report
+    #   G  Next Earnings Date    ← NEW: next expected report date (if available)
+    #   H  Period Type           ← NEW: Q=quarterly, A=annual
+    #   I  Sector Code           (was B)
+    #   J  Sector                (was C)
+    #   K  Group Code            (was D)
+    #   L  Industry Group        (was E)
+    #   M  Industry Code         (was F)
+    #   N  Industry              (was G)
+    #   O  Sub-Industry Code     (was H)
+    #   P  Sub-Industry          (was I)
+    #   Q… daily close prices    (unchanged)
+    log.info(f"   Fetching earnings data for {len(available)} tickers "
+             f"(cached results skip API call)...")
+    earnings_rows = []
+    earnings_hits = 0
+    for t in available:
+        e = get_ticker_earnings(t)
+        earnings_rows.append({
+            "Last EPS":           e["last_eps"],
+            "Last Revenue":       e["last_revenue"],
+            "Last Net Income":    e["last_net_income"],
+            "Last Earnings Date": e["last_earnings_date"],
+            "Next Earnings Date": e["next_earnings_date"],
+            "Period Type":        e["period_type"],
+        })
+        if e["last_eps"] or e["last_revenue"] or e["last_net_income"]:
+            earnings_hits += 1
+    log.info(f"   Earnings: {earnings_hits}/{len(available)} tickers have data")
+
+    # Persist earnings cache to disk after processing this country
+    flush_earnings_cache()
+
+    earnings_df = pd.DataFrame(earnings_rows, index=available)
+
+    # Assemble final output — preserve strict column ordering:
+    # [Full Name | 6 Earnings cols | 8 GICS cols | price date cols]
+    name_col  = meta_df[["Full name Ticker Symbol"]]
+    gics_cols = meta_df.drop(columns=["Full name Ticker Symbol"])
+    df_out    = pd.concat([name_col, earnings_df, gics_cols, df_wide], axis=1)
 
     filename = os.path.join(OUTPUT_DIR, f"{country}_{index_name}_{len(available)}_tickers.csv")
     df_out.to_csv(filename, index_label="Ticker")
-    log.info(f"   ✓ Saved: {filename}  ({df_out.shape[0]} tickers × {df_out.shape[1]-9} days + 9 GICS cols)")
+    n_meta = 9 + 6  # 9 GICS cols + 6 earnings cols
+    log.info(f"   ✓ Saved: {filename}  "
+             f"({df_out.shape[0]} tickers × {df_out.shape[1]-n_meta} days "
+             f"+ {n_meta} meta cols [{earnings_hits} with earnings])")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # COUNTRY JOB LIBRARY — COMPLETE MANUAL TICKER LISTS
