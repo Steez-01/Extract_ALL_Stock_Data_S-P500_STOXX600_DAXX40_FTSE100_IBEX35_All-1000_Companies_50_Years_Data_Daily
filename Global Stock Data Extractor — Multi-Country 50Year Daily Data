@@ -21,10 +21,23 @@ Fixes applied (X–XV):
     bleed, Austria/Norway/Ireland exclude lists, SP500/Mexico suffix fixes
 
 New countries (XVI):
-  Czech Republic (.PR / Prague Stock Exchange PX Index)
-  Hungary (.BD / Budapest Stock Exchange BUX Index)
-  Argentina (.BA / Buenos Aires Stock Exchange MERVAL)
-  — all three exchange suffixes were pre-registered in EXCHANGE_SUFFIX
+  Czech Republic (.PR), Hungary (.BD), Argentina (.BA)
+
+New output format (XVII) — GICS metadata columns:
+  Output CSV now has 9 prefix columns before the ticker and price dates:
+    Col A: Full company name  (from yfinance longName / shortName)
+    Col B: Sector Code        (GICS 2-digit, e.g. 10)
+    Col C: Sector             (e.g. Energy)
+    Col D: Group Code         (GICS 4-digit, e.g. 1010)
+    Col E: Industry Group     (e.g. Energy Equipment & Services)
+    Col F: Industry Code      (GICS 6-digit, e.g. 101010)
+    Col G: Industry           (e.g. Energy Equipment & Services)
+    Col H: Sub-Industry Code  (GICS 8-digit, e.g. 10101010)
+    Col I: Sub-Industry       (e.g. Oil & Gas Drilling)
+    Col J: Ticker             (was Col A in XVI and earlier)
+    Col K onwards: daily close prices (unchanged)
+  The GICS hierarchy is resolved via a lookup file (GICS_Structure_2026.xlsx)
+  placed next to the script. If the file is absent, columns B–I are left blank.
 
 Run modes:
   python script.py                          # all 40 countries, sequential
@@ -85,7 +98,136 @@ EXCHANGE_SUFFIX = {
 def get_suffix(country_code: str) -> str:
     return EXCHANGE_SUFFIX.get(country_code.upper(), "")
 
-# ─── PERSISTENT TICKER CACHE ──────────────────────────────────────────────────
+# ─── GICS METADATA LOOKUP ─────────────────────────────────────────────────────
+# Resolves the full GICS hierarchy for any ticker from:
+#   1. yfinance  → company name + GICS sub-industry code (8-digit)
+#   2. GICS_Structure_2026.xlsx  → the 8-digit code fans out to all 7 other columns
+#
+# Output columns prepended to every CSV row (A–I before the ticker):
+#   A  Full company name
+#   B  Sector Code      (2-digit)
+#   C  Sector
+#   D  Group Code       (4-digit)
+#   E  Industry Group
+#   F  Industry Code    (6-digit)
+#   G  Industry
+#   H  Sub-Industry Code (8-digit)
+#   I  Sub-Industry
+
+GICS_FILE = "GICS_Structure_2026.xlsx"   # expected next to the script
+
+# Loaded once at startup; empty dict if file not found
+_GICS_LOOKUP: dict = {}   # sub_industry_code (int) → dict of 7 columns
+
+def _load_gics_structure() -> dict:
+    """Build a lookup dict from the GICS structure xlsx.
+    Key = sub-industry code (int, 8-digit).
+    Value = dict with keys matching the 7 GICS column names.
+    """
+    if not os.path.exists(GICS_FILE):
+        log.warning(f"   GICS file '{GICS_FILE}' not found — GICS columns will be blank.")
+        return {}
+    try:
+        import pandas as _pd
+        df = _pd.read_excel(GICS_FILE)
+        # Expected columns (from GICS_Structure_2026.xlsx):
+        # Sector Code | Sector | Group Code | Industry Group |
+        # Industry Code | Industry | Sub-Industry Code | Sub-Industry
+        lookup = {}
+        for _, row in df.iterrows():
+            key = int(row["Sub-Industry Code"])
+            lookup[key] = {
+                "sector_code":      int(row["Sector Code"]),
+                "sector":           str(row["Sector"]),
+                "group_code":       int(row["Group Code"]),
+                "industry_group":   str(row["Industry Group"]),
+                "industry_code":    int(row["Industry Code"]),
+                "industry":         str(row["Industry"]),
+                "sub_industry_code":key,
+                "sub_industry":     str(row["Sub-Industry"]),
+            }
+        log.info(f"   GICS structure loaded: {len(lookup)} sub-industries")
+        return lookup
+    except Exception as e:
+        log.warning(f"   GICS structure load failed: {e} — GICS columns will be blank.")
+        return {}
+
+# In-process GICS metadata cache so we never fetch the same ticker twice
+_TICKER_META_CACHE: dict = {}   # ticker → {"name": str, gics fields...}
+
+def get_ticker_meta(ticker: str) -> dict:
+    """Return GICS metadata dict for a ticker.
+
+    Always returns a dict with all 9 keys; values may be empty strings
+    if yfinance or the GICS lookup has no data for this ticker.
+
+    Called once per ticker per country run; results are memoised in
+    _TICKER_META_CACHE for the lifetime of the process.
+    """
+    global _GICS_LOOKUP, _TICKER_META_CACHE
+
+    # Lazy-load GICS structure on first call
+    if not _GICS_LOOKUP:
+        _GICS_LOOKUP = _load_gics_structure()
+
+    if ticker in _TICKER_META_CACHE:
+        return _TICKER_META_CACHE[ticker]
+
+    meta = {
+        "name":             "",
+        "sector_code":      "",
+        "sector":           "",
+        "group_code":       "",
+        "industry_group":   "",
+        "industry_code":    "",
+        "industry":         "",
+        "sub_industry_code":"",
+        "sub_industry":     "",
+    }
+
+    try:
+        info = yf.Ticker(ticker).info
+        # Company name
+        meta["name"] = info.get("longName") or info.get("shortName") or ""
+
+        # yfinance exposes the 8-digit GICS sub-industry code as 'gicsSubIndustryCode'
+        # or we can fall back to building it from 'sector' alone if code absent.
+        # The most reliable field is 'gicsSubIndustryCode' (newer yfinance versions).
+        sub_code_raw = info.get("gicsSubIndustryCode") or info.get("industryKey") or None
+
+        # Try to parse as integer
+        sub_code = None
+        if sub_code_raw is not None:
+            try:
+                sub_code = int(sub_code_raw)
+            except (ValueError, TypeError):
+                pass
+
+        # If we have the 8-digit code, do a full hierarchy lookup
+        if sub_code and sub_code in _GICS_LOOKUP:
+            gics = _GICS_LOOKUP[sub_code]
+            meta.update({
+                "sector_code":       str(gics["sector_code"]),
+                "sector":            gics["sector"],
+                "group_code":        str(gics["group_code"]),
+                "industry_group":    gics["industry_group"],
+                "industry_code":     str(gics["industry_code"]),
+                "industry":          gics["industry"],
+                "sub_industry_code": str(gics["sub_industry_code"]),
+                "sub_industry":      gics["sub_industry"],
+            })
+        else:
+            # Fallback: fill only what yfinance gives us directly
+            meta["sector"] = info.get("sector") or ""
+            meta["industry"] = info.get("industry") or ""
+
+    except Exception as e:
+        log.debug(f"   GICS meta fetch failed for {ticker}: {e}")
+
+    _TICKER_META_CACHE[ticker] = meta
+    return meta
+
+
 
 def load_cache() -> dict:
     if os.path.exists(CACHE_FILE):
@@ -418,9 +560,42 @@ def extract_country_data(job: dict):
     df_wide   = close_df.transpose()
     df_wide.columns = pd.to_datetime(df_wide.columns).strftime("%Y-%m-%d")
 
+    # ── Prepend 9 GICS metadata columns (A–I) before ticker (J) and prices ──
+    # Column layout:
+    #   A  Full company name
+    #   B  Sector Code         (GICS 2-digit)
+    #   C  Sector
+    #   D  Group Code          (GICS 4-digit)
+    #   E  Industry Group
+    #   F  Industry Code       (GICS 6-digit)
+    #   G  Industry
+    #   H  Sub-Industry Code   (GICS 8-digit)
+    #   I  Sub-Industry
+    #   J  Ticker              (index, unchanged from previous versions)
+    #   K… daily close prices  (unchanged)
+    log.info(f"   Fetching GICS metadata for {len(available)} tickers...")
+    meta_rows = []
+    for t in available:
+        m = get_ticker_meta(t)
+        meta_rows.append({
+            "Full name Ticker Symbol": m["name"],
+            "Sector Code":             m["sector_code"],
+            "Sector":                  m["sector"],
+            "Group Code":              m["group_code"],
+            "Industry Group":          m["industry_group"],
+            "Industry Code":           m["industry_code"],
+            "Industry":                m["industry"],
+            "Sub-Industry Code":       m["sub_industry_code"],
+            "Sub-Industry":            m["sub_industry"],
+        })
+
+    meta_df = pd.DataFrame(meta_rows, index=available)
+    # Combine: meta (A–I) | price dates (K onwards); ticker stays as the row index (J)
+    df_out = pd.concat([meta_df, df_wide], axis=1)
+
     filename = os.path.join(OUTPUT_DIR, f"{country}_{index_name}_{len(available)}_tickers.csv")
-    df_wide.to_csv(filename)
-    log.info(f"   ✓ Saved: {filename}  ({df_wide.shape[0]} tickers × {df_wide.shape[1]} days)")
+    df_out.to_csv(filename, index_label="Ticker")
+    log.info(f"   ✓ Saved: {filename}  ({df_out.shape[0]} tickers × {df_out.shape[1]-9} days + 9 GICS cols)")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # COUNTRY JOB LIBRARY — COMPLETE MANUAL TICKER LISTS
